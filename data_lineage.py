@@ -1,437 +1,808 @@
-import pandas as pd
-import os
+"""
+data_lineage.py
+===============
+Builds recursive data-lineage workbooks from Atlan "impact report" exports.
+
+Given one or more impact reports (.csv / .xlsx), the script traces every
+root object (lowest Lineage Depth, e.g. PowerBI queries) back to its source
+tables and writes an Excel workbook that strictly follows the client's
+layout ("RevOps reports - Data Lineage v2.0.xlsx"):
+
+  * one sheet per report, compacted tree layout (parents never repeat),
+  * spacer columns between level groups, purple/pink headers, Messina Sans,
+  * merged Query blocks, "List of sources" and "Remarks" columns,
+  * a "List of Reports" index sheet and a "Source Tables" rollup sheet,
+  * native internal hyperlinks from every pruned duplicate to the cell
+    where that object is fully expanded.
+
+Usage:
+    python data_lineage.py -i report1.xlsx [report2.csv ...] [-o out.xlsx]
+                           [-s] [--no-detailed] [--unformatted]
+                           [--config rules.json] [--gui]
+"""
+
+from __future__ import annotations
+
 import argparse
-import sys
+import json
 import logging
+import os
+import re
+import sys
+from collections import deque
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+import pandas as pd
 
-# --- CONFIGURATION: TRIVIAL RULES ---
-# You can freely toggle these rules or modify the lists to control what gets expanded in the summary view.
+log = logging.getLogger("data_lineage")
+
+# --------------------------------------------------------------------------
+# CONFIGURATION: TRIVIAL RULES
+# Toggle these rules / edit the lists to control what gets expanded.
+# A JSON file passed via --config (or edited in the GUI) overrides them.
+# --------------------------------------------------------------------------
 TRIVIAL_RULES = {
-    # a. Stop expanding if namespace matching database.schema.name, database.schema, or database
+    # a. Stop expanding if the object matches database.schema.name,
+    #    database.schema, or database.
     'enable_namespace_blocking': True,
     'blocked_namespaces': [
-        'PROD_DATALAKE.LOGS',        # Example: Blocks everything in LOGS schema
-        'TEMP_DB'                    # Example: Blocks entire TEMP_DB
+        'PROD_DATALAKE.LOGS',        # blocks everything in the LOGS schema
+        'TEMP_DB',                   # blocks the entire TEMP_DB database
     ],
-    
-    # b. Stop expanding list of tables if level >= X
-    # Put "ALL" in the list for a blanket stop on all tables at/above that level.
+
+    # b. Stop expanding the listed tables once they sit at/above this level.
+    #    Put "ALL" in the list for a blanket stop on every table.
     'enable_high_level_tables': True,
     'high_level_tables_limit': 8,
     'high_level_tables': [
-        'PROD_EDW.ENT.COMMON_DIM'
+        'PROD_EDW.ENT.COMMON_DIM',
     ],
-    
-    # c. Stop expanding list of views if level >= X
-    # Put "ALL" in the list for a blanket stop on all views at/above that level.
+
+    # c. Same as (b) but for views.
     'enable_high_level_views': True,
     'high_level_views_limit': 8,
     'high_level_views': [
-        'PROD_EDW.VIEWS.COMMON_VW'
+        'PROD_EDW.VIEWS.COMMON_VW',
     ],
-    
-    # Apply these trivial pruning rules to the Detailed Lineage output as well
-    'apply_rules_to_detailed': False
+
+    # Apply the pruning rules to the Detailed sheets as well.
+    'apply_rules_to_detailed': False,
 }
 
-# --- CONFIGURATION: EXCEL FORMATTING ---
-# Control the look and feel of the final exported Excel layout here.
+# --------------------------------------------------------------------------
+# CONFIGURATION: EXCEL FORMATTING (matches the client reference workbook)
+# --------------------------------------------------------------------------
 EXCEL_FORMAT = {
-    'header_fill_color': 'DDEBF7', # Light blue background for headers (matches typical professional layouts)
-    'header_font_color': '000000', # Black text for headers
+    'font_name': 'Messina Sans',
+    'font_size': 10,
+    'header_fill': '7030A0',        # purple group-header band
+    'header_font_color': 'FFFFFF',
+    'subheader_fill': 'F2CEEF',     # pink db/schema/object/type band
+    'subheader_font_color': '000000',
+    'index_header_fill': 'E5E8EE',  # grey band on the index sheets
     'apply_borders': True,
     'border_color': '000000',
-    'border_style': 'thin',        # Options: 'thin', 'medium', 'thick'
-    'hyperlink_duplicates': True,  # Converts unexpanded duplicate tables into clickable links pointing to their expanded location
-    'hyperlink_color': '0000FF'    # Blue color for hyperlinks
+    'border_style': 'thin',
+    'hyperlink_duplicates': True,   # link pruned duplicates to their expansion
+    'hyperlink_color': '0563C1',
+    'pad_empty_cells': True,        # client pads empty cells with NBSP
+    'merge_query_blocks': True,     # merge the Query cell over its block
+    'freeze_panes': False,          # client sheets are not frozen
+    'column_widths': {
+        'edge': 5.57, 'query': 39.0, 'db': 22.0, 'schema': 16.0,
+        'object': 36.0, 'type': 7.0, 'spacer': 1.7,
+        'sources': 19.0, 'remarks': 45.0,
+    },
 }
 
+# --------------------------------------------------------------------------
+# CONFIGURATION: "List of sources" labels
+# Longest matching prefix of the leaf's consolidated name wins.
+# Fallback when nothing matches: 'schema', 'db' or 'blank'.
+# --------------------------------------------------------------------------
+SOURCE_LABELS = {
+    'PROD_DATALAKE.CRM_MSCRM': 'CRM',
+    'PROD_DATALAKE.LAWPROD': 'LAWSON',
+    'DATALAKE.PUBLIC': 'LAWSON',
+}
+SOURCE_LABEL_FALLBACK = 'schema'
+
+NBSP = ' '
+
+# Node statuses -------------------------------------------------------------
+ST_EXPANDED = 'expanded'        # children rendered below/right of this node
+ST_SOURCE = 'source'            # true source table (no upstream at all)
+ST_DUP = 'duplicate'            # pruned: already expanded elsewhere
+ST_RULE = 'rule'                # pruned: matched a trivial rule
+ST_CYCLE = 'cycle'              # pruned: all children already on this path
+ST_NO_UPSTREAM = 'no_upstream'  # root object with no lineage in the report
+
+
+class Node:
+    """One occurrence of an object in the lineage tree."""
+    __slots__ = ('name', 'level', 'children', 'status', 'remark', 'coord')
+
+    def __init__(self, name: str, level: int):
+        self.name = name
+        self.level = level
+        self.children: list['Node'] = []
+        self.status = ST_SOURCE
+        self.remark = ''
+        self.coord = None  # Excel coordinate of the object cell, set on render
+
+    def leaves(self):
+        if not self.children:
+            yield self
+        else:
+            for child in self.children:
+                yield from child.leaves()
+
+    def max_level(self) -> int:
+        return max((c.max_level() for c in self.children), default=self.level)
+
+
+def derive_report_name(path: str) -> str:
+    """'New Candidate Funnel Dashboard_Upstream.csv' -> 'New Candidate Funnel Dashboard'."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r'(?i)(__lineage|_upstream|\s*-\s*copy|\s*\(\d+\))+$', '', stem)
+    return stem.strip(' _-') or stem
+
+
+# ===========================================================================
+# LINEAGE ENGINE
+# ===========================================================================
 class DataLineageBuilder:
-    def __init__(self, input_file_path: str, output_file_path: str = None):
+    """Loads an Atlan impact report and builds detailed / summary lineage trees."""
+
+    REQUIRED_COLS = ['Name', 'Database', 'Schema', 'Type', 'Connector',
+                     'Lineage Depth', 'Immediate upstream']
+
+    def __init__(self, input_file_path: str, rules: dict | None = None):
         if not input_file_path:
             raise ValueError("Input file path must be provided.")
-        
         self.input_file_path = os.path.abspath(input_file_path)
-        if output_file_path:
-            self.output_file_path = os.path.abspath(output_file_path)
-        else:
-            base_name = self.input_file_path.rsplit(".", 1)[0]
-            self.output_file_path = f"{base_name}__Lineage.xlsx"
-            
-        self.raw_data = None
-        self.preprocessed_data = None
-        
-        self.object_details = None
-        
-        self.queries_all = None
-        self.root_objects_with_upstream = None
-        self.root_objects_manual = None
-        
-        self.lineage = None
+        self.report_name = derive_report_name(self.input_file_path)
+        self.rules = TRIVIAL_RULES if rules is None else rules
+        self.details: dict[str, dict] = {}     # name -> {Database, Schema, Name, Type}
+        self.adjacency: dict[str, tuple] = {}  # name -> upstream names, in order
+        self.roots: list[str] = []             # objects at the minimum lineage depth
 
-    def load_data(self):
-        """Loads data from CSV or Excel based on the file extension."""
+    # -- loading / preprocessing -------------------------------------------
+    def load(self):
         if not os.path.exists(self.input_file_path):
-            raise FileNotFoundError(f"Input file not found at {self.input_file_path}.")
-            
-        logging.info(f"Loading data from {self.input_file_path}")
-        if self.input_file_path.endswith('.xlsx'):
-            raw_input_file = pd.ExcelFile(self.input_file_path)
-            self.raw_data = raw_input_file.parse(raw_input_file.sheet_names[0])
-        elif self.input_file_path.endswith('.csv'):
-            self.raw_data = pd.read_csv(self.input_file_path)
+            raise FileNotFoundError(f"Input file not found: {self.input_file_path}")
+        log.info("Loading %s", os.path.basename(self.input_file_path))
+        if self.input_file_path.lower().endswith('.xlsx'):
+            df = pd.read_excel(self.input_file_path)
+        elif self.input_file_path.lower().endswith('.csv'):
+            df = pd.read_csv(self.input_file_path)
         else:
-            raise ValueError("Unsupported file format. Please provide a .csv or .xlsx file.")
+            raise ValueError("Unsupported file format, expected .csv or .xlsx")
 
-    def preprocess_data(self):
-        """Preprocesses the raw data to extract consolidated names and structured upstream dependencies."""
-        logging.info("Preprocessing data...")
-        req_cols = ['Name', 'Database', 'Schema', 'Type', 'Connector', 'Lineage Depth', 'Immediate upstream']
-        missing_cols = [col for col in req_cols if col not in self.raw_data.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required columns in input data: {missing_cols}")
+        missing = [c for c in self.REQUIRED_COLS if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns in input: {missing}")
+        self._preprocess(df)
+        return self
 
-        df = self.raw_data.copy()
-        
-        df['Consolidated Name'] = df.apply(
-            lambda row: f"{row['Database']}.{row['Schema']}.{row['Name']}" if row['Connector'] != 'powerbi' else row['Name'], 
-            axis=1
-        )
-        
-        self.object_details = df.drop_duplicates(subset=['Consolidated Name']).set_index('Consolidated Name')
-        
-        if df['Immediate upstream'].notna().any():
-            df['Immediate upstream'] = (
-                df['Immediate upstream']
-                .dropna()
-                .str.split(',')
-                .apply(lambda lst: [
-                    '.'.join(
-                        item.strip().lstrip('(').rstrip(')').split('/')[3:6]
-                    )
-                    for item in lst
-                ] if isinstance(lst, list) else lst)
-            )
-            df.loc[df['Immediate upstream'].isna(), 'Immediate upstream'] = None
+    @staticmethod
+    def _parse_upstream(raw) -> tuple:
+        """Parse Atlan's 'Name (default/connector/id/DB/SCHEMA/NAME)' lists."""
+        if not isinstance(raw, str) or not raw.strip():
+            return ()
+        names = []
+        for inner in re.findall(r'\(([^()]*)\)', raw):
+            parts = inner.strip().split('/')
+            names.append('.'.join(parts[3:6]) if len(parts) >= 6 else parts[-1])
+        return tuple(dict.fromkeys(names))  # de-dupe, keep order
 
-        self.preprocessed_data = df
-        
-        self.queries_all = df[['Consolidated Name', 'Immediate upstream']].copy()
-        self.queries_all.index = pd.RangeIndex(1, len(self.queries_all) + 1)
-        
+    def _preprocess(self, df: pd.DataFrame):
+        is_pbi = df['Connector'].eq('powerbi')
+        full = (df['Database'].astype(str) + '.' + df['Schema'].astype(str)
+                + '.' + df['Name'].astype(str))
+        df = df.assign(**{'Consolidated Name': full.where(~is_pbi, df['Name'])})
+
+        first = df.drop_duplicates(subset=['Consolidated Name'])
+        self.details = (first.set_index('Consolidated Name')
+                        [['Database', 'Schema', 'Name', 'Type']].to_dict('index'))
+
+        self.adjacency = {
+            cn: ups for cn, ups in zip(first['Consolidated Name'],
+                                       first['Immediate upstream'].map(self._parse_upstream))
+            if ups
+        }
+
         min_depth = df['Lineage Depth'].min()
-        root_objects_df = df[df['Lineage Depth'] == min_depth]
-        
-        self.root_objects_with_upstream = root_objects_df[root_objects_df['Immediate upstream'].notnull()][['Consolidated Name', 'Immediate upstream']].copy()
-        self.root_objects_with_upstream.index = pd.RangeIndex(1, len(self.root_objects_with_upstream) + 1)
-        
-        self.root_objects_manual = root_objects_df[root_objects_df['Immediate upstream'].isnull()][['Consolidated Name', 'Immediate upstream']].copy()
-        self.root_objects_manual.index = pd.RangeIndex(1, len(self.root_objects_manual) + 1)
+        self.roots = first.loc[first['Lineage Depth'] == min_depth,
+                               'Consolidated Name'].tolist()
+        log.info("  %d objects, %d roots (depth %s), %d with upstream",
+                 len(first), len(self.roots), min_depth, len(self.adjacency))
 
-    def _evaluate_trivial_rules(self, name: str, level: int, rules: dict) -> bool:
-        if name not in self.object_details.index:
-            return False
-        
-        details = self.object_details.loc[name]
-        
+    def object_meta(self, name: str) -> dict:
+        """Metadata for a node; falls back to parsing the consolidated name."""
+        meta = self.details.get(name)
+        if meta:
+            return meta
+        parts = name.split('.')
+        if len(parts) >= 3:
+            return {'Database': parts[0], 'Schema': parts[1],
+                    'Name': '.'.join(parts[2:]), 'Type': ''}
+        return {'Database': '', 'Schema': '', 'Name': name, 'Type': ''}
+
+    # -- pruning rules -------------------------------------------------------
+    def _trivial_reason(self, name: str, level: int) -> str | None:
+        rules = self.rules
         if rules.get('enable_namespace_blocking'):
-            blocked = rules.get('blocked_namespaces', [])
-            if any(name.startswith(ns) for ns in blocked):
+            for ns in rules.get('blocked_namespaces', []):
+                if name == ns or name.startswith(ns + '.'):
+                    return f'Not expanded: blocked namespace {ns}'
+        obj_type = str(self.object_meta(name).get('Type', '')).upper()
+        for kind, flag, limit_key, list_key in (
+                ('TABLE', 'enable_high_level_tables', 'high_level_tables_limit', 'high_level_tables'),
+                ('VIEW', 'enable_high_level_views', 'high_level_views_limit', 'high_level_views')):
+            if kind in obj_type and rules.get(flag):
+                limit = rules.get(limit_key, 99)
+                targets = rules.get(list_key, [])
+                if level >= limit and ('ALL' in (t.upper() for t in targets) or name in targets):
+                    return f'Not expanded: {kind.lower()} at level L{level} >= L{limit}'
+        return None
+
+    # -- tree building -------------------------------------------------------
+    def _min_depths(self, apply_rules: bool) -> dict[str, int]:
+        """BFS shortest depth per reachable node, honouring pruning rules."""
+        depth = {r: 0 for r in self.roots}
+        queue = deque(self.roots)
+        while queue:
+            name = queue.popleft()
+            if apply_rules and self._trivial_reason(name, depth[name]):
+                continue
+            for child in self.adjacency.get(name, ()):
+                if child not in depth:
+                    depth[child] = depth[name] + 1
+                    queue.append(child)
+        return depth
+
+    def build_tree(self, summarize: bool) -> tuple[list[Node], dict[str, Node]]:
+        """
+        Returns (root nodes, expanded_at). In summary mode every object is
+        expanded exactly once, at its minimum depth; later occurrences become
+        ST_DUP leaves pointing back at the expansion (via expanded_at).
+        """
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), 50_000))
+        apply_rules = summarize or self.rules.get('apply_rules_to_detailed', False)
+        min_depth = self._min_depths(apply_rules) if summarize else {}
+        expanded_at: dict[str, Node] = {}
+
+        def make(name: str, level: int, path: frozenset) -> Node:
+            node = Node(name, level)
+            children = self.adjacency.get(name, ())
+            if not children:
+                node.status = ST_NO_UPSTREAM if level == 0 else ST_SOURCE
+                if level == 0:
+                    node.remark = 'No upstream lineage found in the impact report'
+                return node
+            if apply_rules:
+                reason = self._trivial_reason(name, level)
+                if reason:
+                    node.status, node.remark = ST_RULE, reason
+                    return node
+            if summarize and (name in expanded_at or level != min_depth.get(name, level)):
+                node.status = ST_DUP
+                return node
+            kids = [c for c in children if c not in path]
+            if not kids:
+                node.status, node.remark = ST_CYCLE, 'Circular reference'
+                return node
+            node.status = ST_EXPANDED
+            if summarize:
+                expanded_at[name] = node
+            child_path = path | {name}
+            node.children = [make(c, level + 1, child_path) for c in kids]
+            return node
+
+        roots = [make(r, 0, frozenset()) for r in self.roots]
+        mode = 'summary' if summarize else 'detailed'
+        log.info("  Built %s tree: %d rows, max depth L%d", mode,
+                 sum(1 for r in roots for _ in r.leaves()),
+                 max(r.max_level() for r in roots))
+        return roots, expanded_at
+
+    def source_tables(self) -> list[str]:
+        """All reachable objects that have no upstream (true sources)."""
+        reachable = self._min_depths(apply_rules=False)
+        return [n for n in reachable if not self.adjacency.get(n)]
+
+
+# ===========================================================================
+# EXCEL RENDERER (strict client layout)
+# ===========================================================================
+class ClientExcelRenderer:
+    DATA_START_ROW = 4   # row 1 blank, row 2 group header, row 3 sub header
+
+    def __init__(self, fmt: dict | None = None, source_labels: dict | None = None,
+                 source_fallback: str | None = None):
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+        self.fmt = EXCEL_FORMAT if fmt is None else fmt
+        self.source_labels = SOURCE_LABELS if source_labels is None else source_labels
+        self.source_fallback = (SOURCE_LABEL_FALLBACK if source_fallback is None
+                                else source_fallback)
+        f = self.fmt
+        self.font_data = Font(name=f['font_name'], size=f['font_size'])
+        self.font_header = Font(name=f['font_name'], size=f['font_size'], bold=True,
+                                color=f['header_font_color'])
+        self.font_subheader = Font(name=f['font_name'], size=f['font_size'], bold=True,
+                                   color=f['subheader_font_color'])
+        self.font_link = Font(name=f['font_name'], size=f['font_size'],
+                              color=f['hyperlink_color'], underline='single')
+        self.fill_header = PatternFill('solid', start_color=f['header_fill'])
+        self.fill_subheader = PatternFill('solid', start_color=f['subheader_fill'])
+        self.fill_white = PatternFill('solid', start_color='FFFFFF')
+        self.fill_index = PatternFill('solid', start_color=f['index_header_fill'])
+        side = Side(border_style=f['border_style'], color=f['border_color'])
+        self.border = (Border(left=side, right=side, top=side, bottom=side)
+                       if f['apply_borders'] else None)
+        self.align_center = Alignment(horizontal='center', vertical='center',
+                                      wrap_text=True)
+
+    # -- helpers -------------------------------------------------------------
+    def source_label(self, name: str, meta: dict) -> str:
+        best = ''
+        for prefix, label in self.source_labels.items():
+            if (name == prefix or name.startswith(prefix + '.')) and len(prefix) > len(best):
+                best, match = prefix, label
+        if best:
+            return match
+        if self.source_fallback == 'schema':
+            return str(meta.get('Schema') or '')
+        if self.source_fallback == 'db':
+            return str(meta.get('Database') or '')
+        return ''
+
+    @staticmethod
+    def safe_sheet_name(name: str, taken: set, suffix: str = '') -> str:
+        clean = re.sub(r"[\[\]:*?/\\']", ' ', name).strip()
+        base = (clean[:31 - len(suffix)] + suffix).strip()
+        candidate, n = base, 2
+        while candidate.lower() in taken:
+            tail = f' ({n})'
+            candidate = base[:31 - len(tail)] + tail
+            n += 1
+        taken.add(candidate.lower())
+        return candidate
+
+    # -- lineage sheet ---------------------------------------------------------
+    def render_lineage_sheet(self, wb, title: str, builder: DataLineageBuilder,
+                             roots: list[Node], expanded_at: dict[str, Node],
+                             link_dups: bool) -> dict:
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.hyperlink import Hyperlink
+
+        ws = wb.create_sheet(title)
+        max_depth = max(1, max(r.max_level() for r in roots))
+
+        col_query = 2
+        group_col = lambda lvl: 3 + 5 * (lvl - 1)          # db col of level group
+        col_sources = 3 + 5 * max_depth
+        col_remarks = col_sources + 1
+        last_col = col_remarks
+
+        # ---- lay the tree out into a plain Python grid first (fast), then
+        # bulk-append to the sheet; cell-by-cell writes are far too slow ----
+        pad = NBSP if self.fmt.get('pad_empty_cells', True) else None
+
+        def new_list() -> list:
+            # list index i maps to sheet column i+1; column A stays empty
+            values = [pad] * last_col
+            values[0] = None
+            return values
+
+        header2 = new_list()
+        header3 = new_list()
+        header2[col_query - 1] = 'Query'
+        for lvl in range(1, max_depth + 1):
+            c = group_col(lvl) - 1
+            header2[c] = 'Sources (L1)' if lvl == 1 else f'Underlying sources (L{lvl})'
+            header3[c:c + 4] = ('db', 'schema', 'object', 'type')
+        header2[col_sources - 1] = 'List of sources'
+        header2[col_remarks - 1] = 'Remarks'
+
+        grid: list[list] = []      # data rows only (sheet rows 4..)
+        dup_nodes: list[Node] = []
+        query_blocks: list[tuple[int, int]] = []
+
+        def new_row() -> list:
+            grid.append(new_list())
+            return grid[-1]
+
+        def write_node(node: Node, row: list) -> list:
+            sheet_row = len(grid) + self.DATA_START_ROW - 1
+            if node.level == 0:
+                row[col_query - 1] = node.name
+                node.coord = f'{get_column_letter(col_query)}{sheet_row}'
+            else:
+                meta = builder.object_meta(node.name)
+                c = group_col(node.level) - 1
+                row[c:c + 4] = (meta['Database'], meta['Schema'],
+                                meta['Name'], meta['Type'])
+                node.coord = f'{get_column_letter(c + 3)}{sheet_row}'
+            if node.children:
+                for i, child in enumerate(node.children):
+                    row = write_node(child, row if i == 0 else new_row())
+                return row
+            # leaf row: list-of-sources + remarks
+            if node.level > 0:
+                row[col_sources - 1] = self.source_label(
+                    node.name, builder.object_meta(node.name))
+            if node.remark:
+                row[col_remarks - 1] = node.remark
+            if node.status == ST_DUP:
+                dup_nodes.append(node)
+            return row
+
+        for root in roots:
+            start = len(grid) + self.DATA_START_ROW
+            write_node(root, new_row())
+            query_blocks.append((start, len(grid) + self.DATA_START_ROW - 1))
+        last_row = len(grid) + self.DATA_START_ROW - 1
+
+        ws.append([])              # row 1 stays blank (client leaves an edge)
+        ws.append(header2)
+        ws.append(header3)
+        for row in grid:
+            ws.append(row)
+
+        # ---- style pass: assign a prebuilt style array (font + border) to
+        # every cell. Copying the array is ~10x faster than setting
+        # .font/.border individually on two million cells. Each cell needs
+        # its OWN copy: openpyxl style setters mutate the array in place,
+        # so sharing one instance would bleed later changes everywhere. ----
+        from copy import copy as _copy
+        probe = ws.cell(row=1, column=1)
+        original = probe._style
+        probe.font = self.font_data
+        if self.border:
+            probe.border = self.border
+        base_style = probe._style
+        probe._style = original
+        for cells in ws.iter_rows(min_row=2, max_row=last_row,
+                                  min_col=2, max_col=last_col):
+            for cell in cells:
+                cell._style = _copy(base_style)
+
+        # ---- header styling & merges ----
+        spacer_cols = {group_col(l) + 4 for l in range(1, max_depth + 1)}
+        for r in (2, 3):
+            for c in range(2, last_col + 1):
+                cell = ws.cell(row=r, column=c)
+                if c in spacer_cols:
+                    cell.fill = self.fill_white
+                    cell.font = self.font_header if r == 2 else self.font_subheader
+                elif r == 2:
+                    cell.fill, cell.font = self.fill_header, self.font_header
+                else:
+                    cell.fill, cell.font = self.fill_subheader, self.font_subheader
+        ws.merge_cells(start_row=2, start_column=col_query, end_row=3, end_column=col_query)
+        for lvl in range(1, max_depth + 1):
+            c = group_col(lvl)
+            ws.merge_cells(start_row=2, start_column=c, end_row=2, end_column=c + 3)
+        for c in (col_sources, col_remarks):
+            ws.merge_cells(start_row=2, start_column=c, end_row=3, end_column=c)
+
+        # ---- merge query blocks (client centers these) ----
+        if self.fmt.get('merge_query_blocks', True):
+            for start, end in query_blocks:
+                if end > start:
+                    ws.merge_cells(start_row=start, start_column=col_query,
+                                   end_row=end, end_column=col_query)
+                top = ws.cell(row=start, column=col_query)
+                top.alignment = self.align_center
+
+        # ---- hyperlinks: pruned duplicates -> expansion location ----
+        n_links = 0
+        if link_dups and self.fmt.get('hyperlink_duplicates', True):
+            for node in dup_nodes:
+                target = expanded_at.get(node.name)
+                if target is None or target.coord is None:
+                    continue
+                cell = ws[node.coord]
+                cell.hyperlink = Hyperlink(ref=node.coord,
+                                           location=f"'{title}'!{target.coord}",
+                                           tooltip=f'Expanded at {target.coord}')
+                cell.font = self.font_link
+                n_links += 1
+
+        # ---- column widths ----
+        w = self.fmt['column_widths']
+        ws.column_dimensions['A'].width = w['edge']
+        ws.column_dimensions[get_column_letter(col_query)].width = w['query']
+        for lvl in range(1, max_depth + 1):
+            c = group_col(lvl)
+            for off, key in enumerate(('db', 'schema', 'object', 'type')):
+                ws.column_dimensions[get_column_letter(c + off)].width = w[key]
+            ws.column_dimensions[get_column_letter(c + 4)].width = w['spacer']
+        ws.column_dimensions[get_column_letter(col_sources)].width = w['sources']
+        ws.column_dimensions[get_column_letter(col_remarks)].width = w['remarks']
+
+        if self.fmt.get('freeze_panes'):
+            ws.freeze_panes = ws.cell(row=self.DATA_START_ROW, column=3)
+
+        return {'sheet': title, 'rows': last_row - self.DATA_START_ROW + 1,
+                'max_depth': max_depth, 'queries': len(roots), 'links': n_links}
+
+    # -- simple styled grid (index / rollup sheets) ----------------------------
+    def _write_grid(self, ws, header: list[str], rows: list[list], widths: list[float]):
+        from openpyxl.utils import get_column_letter
+        ws.column_dimensions['A'].width = self.fmt['column_widths']['edge']
+        for j, (text, width) in enumerate(zip(header, widths)):
+            cell = ws.cell(row=2, column=2 + j, value=text)
+            cell.fill = self.fill_index
+            cell.font = self.font_data
+            if self.border:
+                cell.border = self.border
+            ws.column_dimensions[get_column_letter(2 + j)].width = width
+        for i, row in enumerate(rows):
+            for j, value in enumerate(row):
+                cell = ws.cell(row=3 + i, column=2 + j, value=value)
+                cell.font = self.font_data
+                if self.border:
+                    cell.border = self.border
+
+
+# ===========================================================================
+# WORKBOOK ASSEMBLY
+# ===========================================================================
+def build_workbooks(input_files: list[str], output_path: str | None = None,
+                    rules: dict | None = None, fmt: dict | None = None,
+                    source_labels: dict | None = None, source_fallback: str | None = None,
+                    include_detailed: bool = True, separate_detailed: bool = False,
+                    unformatted: bool = False, progress=None) -> list[str]:
+    """Process every input file and write the output workbook(s).
+    Returns the list of files written. `progress` is an optional callback(str)."""
+    import openpyxl
+
+    def report_progress(msg):
+        log.info(msg)
+        if progress:
+            progress(msg)
+
+    if not input_files:
+        raise ValueError("No input files provided.")
+    if output_path is None:
+        first = os.path.abspath(input_files[0])
+        if len(input_files) == 1:
+            output_path = os.path.splitext(first)[0] + '__Lineage.xlsx'
+        else:
+            output_path = os.path.join(os.path.dirname(first), 'Data Lineage Report.xlsx')
+    output_path = os.path.abspath(output_path)
+
+    # ---- build all lineage trees ----
+    reports = []
+    for path in input_files:
+        builder = DataLineageBuilder(path, rules=rules).load()
+        report_progress(f"Tracing lineage: {builder.report_name}")
+        summary_roots, expanded_at = builder.build_tree(summarize=True)
+        detailed = builder.build_tree(summarize=False) if include_detailed else (None, None)
+        reports.append({'builder': builder, 'summary': (summary_roots, expanded_at),
+                        'detailed': detailed})
+
+    if unformatted:
+        return [_export_unformatted(reports, output_path)]
+
+    renderer = ClientExcelRenderer(fmt, source_labels, source_fallback)
+    written = []
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    index_ws = wb.create_sheet('List of Reports')
+
+    detail_wb = None
+    detail_path = None
+    if include_detailed and separate_detailed:
+        detail_wb = openpyxl.Workbook()
+        detail_wb.remove(detail_wb.active)
+        detail_path = re.sub(r'\.xlsx$', '', output_path, flags=re.I) + '_Detailed.xlsx'
+
+    taken_main, taken_detail = {'list of reports', 'source tables'}, set()
+    index_rows = []
+    for rep in reports:
+        builder = rep['builder']
+        report_progress(f"Writing sheets: {builder.report_name}")
+        summary_roots, expanded_at = rep['summary']
+        s_name = renderer.safe_sheet_name(builder.report_name, taken_main)
+        s_info = renderer.render_lineage_sheet(wb, s_name, builder, summary_roots,
+                                               expanded_at, link_dups=True)
+        d_info = None
+        if include_detailed:
+            d_roots, d_exp = rep['detailed']
+            target_wb = detail_wb if separate_detailed else wb
+            taken = taken_detail if separate_detailed else taken_main
+            d_name = renderer.safe_sheet_name(builder.report_name, taken,
+                                              suffix='' if separate_detailed else ' (Detailed)')
+            d_info = renderer.render_lineage_sheet(target_wb, d_name, builder, d_roots,
+                                                   d_exp, link_dups=False)
+        rep['s_info'], rep['d_info'] = s_info, d_info
+        index_rows.append([builder.report_name, s_info['queries'],
+                           len(builder.source_tables()), f"L{s_info['max_depth']}",
+                           s_info['rows'], d_info['rows'] if d_info else '-',
+                           os.path.basename(builder.input_file_path)])
+
+    # ---- index sheet ----
+    renderer._write_grid(index_ws,
+                         ['Report', 'Queries', 'Source tables', 'Max depth',
+                          'Summary rows', 'Detailed rows', 'Input file'],
+                         index_rows,
+                         [45, 10, 13, 10, 13, 13, 45])
+    from openpyxl.worksheet.hyperlink import Hyperlink
+    for i, rep in enumerate(reports):
+        cell = index_ws.cell(row=3 + i, column=2)
+        cell.hyperlink = Hyperlink(ref=cell.coordinate,
+                                   location=f"'{rep['s_info']['sheet']}'!B2")
+        cell.font = renderer.font_link
+
+    # ---- source tables rollup ----
+    _add_source_rollup(wb, renderer, reports)
+
+    written.append(_safe_save(wb, output_path))
+    if detail_wb is not None:
+        written.append(_safe_save(detail_wb, detail_path))
+    for path in written:
+        report_progress(f"Saved {path}")
+    return written
+
+
+def _add_source_rollup(wb, renderer: ClientExcelRenderer, reports: list[dict]):
+    """One row per distinct source table across all reports — the migration worklist."""
+    usage: dict[str, dict] = {}
+    for rep in reports:
+        builder = rep['builder']
+        for name in builder.source_tables():
+            entry = usage.setdefault(name, {'meta': builder.object_meta(name), 'reports': []})
+            entry['reports'].append(builder.report_name)
+    rows = []
+    for name in sorted(usage):
+        meta, reps = usage[name]['meta'], usage[name]['reports']
+        rows.append([meta['Database'], meta['Schema'], meta['Name'], meta['Type'],
+                     renderer.source_label(name, meta), len(reps), ', '.join(sorted(set(reps)))])
+    ws = wb.create_sheet('Source Tables')
+    renderer._write_grid(ws, ['db', 'schema', 'object', 'type', 'List of sources',
+                              'Used by # reports', 'Reports'],
+                         rows, [24, 18, 40, 8, 19, 16, 60])
+
+
+def _export_unformatted(reports: list[dict], output_path: str) -> str:
+    """Raw wide dump: one row per leaf path, plain single-row header."""
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        for rep in reports:
+            builder = rep['builder']
+            for label, data in (('Summary', rep['summary']), ('Detailed', rep['detailed'])):
+                if data is None or data[0] is None:
+                    continue
+                roots = data[0]
+                records = []
+                for root in roots:
+                    for leaf in root.leaves():
+                        path = _path_to(root, leaf)
+                        rec = {'L0': path[0].name}
+                        for node in path[1:]:
+                            meta = builder.object_meta(node.name)
+                            i = node.level
+                            rec.update({f'Database_L{i}': meta['Database'],
+                                        f'Schema_L{i}': meta['Schema'],
+                                        f'L{i}': meta['Name'],
+                                        f'Type_L{i}': meta['Type']})
+                        rec['Status'] = leaf.status
+                        rec['Remark'] = leaf.remark
+                        records.append(rec)
+                sheet = ClientExcelRenderer.safe_sheet_name(
+                    builder.report_name, {s.lower() for s in writer.sheets},
+                    suffix=f' {label}')
+                pd.DataFrame(records).to_excel(writer, sheet_name=sheet, index=False)
+    return output_path
+
+
+def _path_to(root: Node, leaf: Node) -> list[Node]:
+    """Root-to-leaf node path (DFS)."""
+    path = []
+
+    def walk(node):
+        path.append(node)
+        if node is leaf:
+            return True
+        for child in node.children:
+            if walk(child):
                 return True
-                
-        obj_type = str(details.get('Type', '')).upper()
-        
-        if 'TABLE' in obj_type and rules.get('enable_high_level_tables'):
-            if level >= rules.get('high_level_tables_limit', 99):
-                targets = rules.get('high_level_tables', [])
-                if "ALL" in (t.upper() for t in targets) or name in targets:
-                    return True
-                    
-        if 'VIEW' in obj_type and rules.get('enable_high_level_views'):
-            if level >= rules.get('high_level_views_limit', 99):
-                targets = rules.get('high_level_views', [])
-                if "ALL" in (t.upper() for t in targets) or name in targets:
-                    return True
-                    
+        path.pop()
         return False
 
-    def build_lineage(self, summarize=False, trivial_rules=None):
-        """
-        Iteratively traces dependencies backwards to build the pure name lineage hierarchy.
-        If summarize=True, expands each node only once, at its lowest depth, and respects trivial rules.
-        """
-        logging.info(f"Building lineage trace... (Summarize Mode: {summarize})")
-        self.lineage = self.root_objects_with_upstream[['Consolidated Name']].copy()
-        self.lineage.rename(columns={'Consolidated Name': 'L0'}, inplace=True)
-        
-        current_level = 1
-        global_expanded = set()
-        
-        # Remove premature L0 seeding from here
-        
-        while True:
-            prev_col = f'L{current_level-1}'
-            curr_col = f'L{current_level}'
-            
-            self.lineage = pd.merge(
-                self.lineage,
-                self.queries_all[['Immediate upstream', 'Consolidated Name']],
-                left_on=prev_col,
-                right_on='Consolidated Name',
-                how='left'
-            )
-            self.lineage.drop(columns=['Consolidated Name'], inplace=True)
-            self.lineage.rename(columns={'Immediate upstream': curr_col}, inplace=True)
-            
-            if summarize:
-                # 1. Trivial Rules Branch Pruning
-                if trivial_rules:
-                    skip_mask = self.lineage[prev_col].apply(lambda x: self._evaluate_trivial_rules(x, current_level-1, trivial_rules))
-                    self.lineage.loc[skip_mask, curr_col] = None
-                
-                # 2. Expand-Once Check
-                duplicates_mask = self.lineage[prev_col].duplicated(keep='first')
-                self.lineage.loc[duplicates_mask, curr_col] = None
-                
-                already_expanded_mask = self.lineage[prev_col].isin(global_expanded) & (~duplicates_mask)
-                self.lineage.loc[already_expanded_mask, curr_col] = None
-                
-                newly_expanded = self.lineage.loc[self.lineage[curr_col].notna(), prev_col].unique()
-                global_expanded.update(newly_expanded)
-            
-            # Remove self-references
-            def filter_circular(r):
-                if not isinstance(r[curr_col], list):
-                    return r[curr_col]
-                seen = {r[f'L{i}'] for i in range(current_level-1, 0, -1) if f'L{i}' in r}
-                return [v for v in r[curr_col] if v not in seen]
+    walk(root)
+    return path
 
-            self.lineage[curr_col] = self.lineage.apply(filter_circular, axis=1)
-            
-            self.lineage = self.lineage.explode(curr_col)
-            self.lineage.index = pd.RangeIndex(1, len(self.lineage) + 1)
-            
-            if not self.lineage[curr_col].notna().any():
-                self.lineage.drop(columns=[curr_col], inplace=True)
-                logging.info(f"No more upstream dependencies found at Level {current_level}. Stopping iteration.")
-                break
-            
-            logging.info(f"Completed pure name Level {current_level}. Total records so far: {len(self.lineage)}")
-            current_level += 1
-            
-    def apply_metadata(self, metadata_cols: list = None):
-        """Joins metadata fields iteratively per lineage level into the final output dataframe."""
-        if self.lineage is None:
-            raise ValueError("Lineage has not been built yet. Call build_lineage() first.")
-            
-        if metadata_cols is None:
-            metadata_cols = ['Type', 'Database', 'Schema', 'Name']
-            
-        logging.info(f"Applying metadata columns: {metadata_cols}")
-        level_cols = [col for col in self.lineage.columns if col.startswith('L')]
-        
-        final_df = pd.DataFrame(index=self.lineage.index)
-        
-        for level_col in level_cols:
-            final_df[level_col] = self.lineage[level_col]
-            for md_col in metadata_cols:
-                target_col = f"{md_col}_{level_col}"
-                final_df[target_col] = final_df[level_col].map(self.object_details[md_col])
-                
-        self.lineage = final_df
 
-def reformat_for_client(df):
-    """Reorders columns and creates a MultiIndex header to match the client's Excel layout."""
-    level_cols = [col for col in df.columns if col.startswith('L') and '_' not in col]
-    max_level = len(level_cols) - 1
-    
-    # We only want L0, then Database_L1, Schema_L1, L1, Type_L1, etc.
-    col_order = ['L0']
-    for i in range(1, max_level + 1):
-        col_order.extend([f'Database_L{i}', f'Schema_L{i}', f'L{i}', f'Type_L{i}'])
-        
-    # keep only columns that exist
-    col_order = [c for c in col_order if c in df.columns]
-    df_reordered = df[col_order].copy()
-    
-    # Build MultiIndex header tuples
-    tuples = [('Query', '')]
-    for i in range(1, max_level + 1):
-        if f'L{i}' in df.columns:
-            group_name = 'Sources (L1)' if i == 1 else f'Underlying Sources (L{i})'
-            tuples.extend([
-                (group_name, 'db'),
-                (group_name, 'schema'),
-                (group_name, 'object'),
-                (group_name, 'type')
-            ])
-            
-    df_reordered.columns = pd.MultiIndex.from_tuples(tuples)
-    return df_reordered
-
-def apply_excel_formatting(file_path):
-    """Uses openpyxl to apply colors, borders, and hyperlink duplicates."""
-    import openpyxl
-    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-    
-    logging.info("Applying openpyxl formatting rules...")
-    wb = openpyxl.load_workbook(file_path)
-    
-    fill = PatternFill(start_color=EXCEL_FORMAT['header_fill_color'], end_color=EXCEL_FORMAT['header_fill_color'], fill_type="solid")
-    font = Font(color=EXCEL_FORMAT['header_font_color'], bold=True)
-    align_center = Alignment(horizontal='center', vertical='center')
-    
-    border = None
-    if EXCEL_FORMAT['apply_borders']:
-        side = Side(border_style=EXCEL_FORMAT['border_style'], color=EXCEL_FORMAT['border_color'])
-        border = Border(top=side, bottom=side, left=side, right=side)
-        
-    hl_font = Font(color=EXCEL_FORMAT['hyperlink_color'], underline="single")
-    
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        
-        # Pandas MultiIndex requires index=True, which adds an unwanted row index column. Remove it.
-        ws.delete_cols(1)
-        
-        # 1. Format Headers (Rows 1 and 2 because of MultiIndex)
-        for row in range(1, 3):
-            for cell in ws[row]:
-                cell.fill = fill
-                cell.font = font
-                cell.alignment = align_center
-                if border:
-                    cell.border = border
-                    
-        # Apply borders to all data
-        if border:
-            for row in ws.iter_rows(min_row=3, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-                for cell in row:
-                    if cell.value is not None:
-                        cell.border = border
-                        
-        # 2. Hyperlink Duplicates
-        if EXCEL_FORMAT['hyperlink_duplicates']:
-            first_seen = {}
-            # L0 is col 1. L1 object is col 4. L2 object is col 8...
-            object_cols = [1] + [4 + (i-1)*4 for i in range(1, 50)]
-            
-            for row in range(3, ws.max_row + 1):
-                for col_idx in object_cols:
-                    if col_idx > ws.max_column:
-                        break
-                        
-                    cell = ws.cell(row=row, column=col_idx)
-                    val = cell.value
-                    if val is not None and str(val).strip() != "":
-                        if col_idx == 1:
-                            unique_name = str(val).strip()
-                        else:
-                            db = ws.cell(row=row, column=col_idx-2).value or ""
-                            schema = ws.cell(row=row, column=col_idx-1).value or ""
-                            unique_name = f"{db}.{schema}.{val}"
-                            
-                            # Check first_seen
-                        if unique_name not in first_seen:
-                            first_seen[unique_name] = cell.coordinate
-                        else:
-                            # It's a duplicate. Map it to the target coordinate
-                            target_coord = first_seen[unique_name]
-                            cell.value = f'=HYPERLINK("#\'{sheet_name}\'!{target_coord}", "{val}")'
-                            cell.font = hl_font
-                            cell.style = "Hyperlink"
-                            
-    wb.save(file_path)
-
-def export_all(detailed_df, summary_df, output_path, separate=False, do_format=True):
-    """Exports the lineages and conditionally styles them."""
-    if detailed_df is None:
-        raise ValueError("Lineages have not been built properly.")
-        
-    # Reformat columns if formatting is enabled
-    if do_format:
-        detailed_df = reformat_for_client(detailed_df)
-        summary_df = reformat_for_client(summary_df)
-        
+def _safe_save(wb, path: str) -> str:
+    """Save the workbook; fall back to a numbered name if the file is locked by Excel."""
     try:
-        # If we have a MultiIndex (do_format=True), pandas requires index=True. We delete it later in openpyxl.
-        write_idx = True if do_format else False
-        
-        if separate:
-            # Export Detailed
-            logging.info(f"Saving detailed lineage to {output_path}")
-            detailed_df.to_excel(output_path, index=write_idx)
-            if do_format: apply_excel_formatting(output_path)
-            
-            # Export Summary
-            sum_path = output_path.replace('.xlsx', '_Summary.xlsx')
-            logging.info(f"Saving summarized lineage to {sum_path}")
-            summary_df.to_excel(sum_path, index=write_idx)
-            if do_format: apply_excel_formatting(sum_path)
-        else:
-            # Single file, multiple sheets
-            logging.info(f"Saving lineage to Excel file (multi-sheet): {output_path}")
-            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                detailed_df.to_excel(writer, sheet_name='Detailed_Lineage', index=write_idx)
-                summary_df.to_excel(writer, sheet_name='Summary_Lineage', index=write_idx)
-            if do_format: apply_excel_formatting(output_path)
-                
-        logging.info("Lineage saved successfully.")
-    except Exception as e:
-        logging.error(f"Error occurred while saving Excel file: {e}")
+        wb.save(path)
+        return path
+    except PermissionError:
+        base, ext = os.path.splitext(path)
+        for n in range(1, 100):
+            alt = f'{base} ({n}){ext}'
+            try:
+                wb.save(alt)
+                log.warning("'%s' is open in Excel — saved as '%s' instead.",
+                            os.path.basename(path), os.path.basename(alt))
+                return alt
+            except PermissionError:
+                continue
+        raise
 
-def main():
-    parser = argparse.ArgumentParser(description="Recursively expand data lineage from Atlan impact reports.")
-    parser.add_argument("-i", "--input", type=str, help="Path to the Atlan impact report (.csv or .xlsx)")
-    parser.add_argument("-o", "--output", type=str, help="Path to the output Excel file (optional)")
-    parser.add_argument("-s", "--separate", action="store_true", help="Export summary lineage to a separate file")
-    parser.add_argument("--unformatted", action="store_true", help="Export raw dataframe without Excel styling or MultiIndex layouts")
-    
-    args = parser.parse_args()
-    
-    input_file = args.input
-    output_file = args.output
-    
-    if not input_file:
-        print("Please enter the path to the Atlan impact report (.csv or .xlsx):")
+
+# ===========================================================================
+# CONFIG / CLI
+# ===========================================================================
+def load_config(path: str):
+    """Merge a JSON config file over the module-level defaults."""
+    with open(path, encoding='utf-8') as fh:
+        cfg = json.load(fh)
+    TRIVIAL_RULES.update(cfg.get('trivial_rules', {}))
+    EXCEL_FORMAT.update(cfg.get('excel_format', {}))
+    if 'source_labels' in cfg:
+        SOURCE_LABELS.clear()
+        SOURCE_LABELS.update(cfg['source_labels'])
+    global SOURCE_LABEL_FALLBACK
+    SOURCE_LABEL_FALLBACK = cfg.get('source_label_fallback', SOURCE_LABEL_FALLBACK)
+    log.info("Loaded config overrides from %s", path)
+
+
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    parser = argparse.ArgumentParser(
+        description="Recursively expand data lineage from Atlan impact reports "
+                    "into a client-formatted Excel workbook.")
+    parser.add_argument('-i', '--input', nargs='+',
+                        help="One or more Atlan impact reports (.csv or .xlsx)")
+    parser.add_argument('-o', '--output', help="Output .xlsx path (optional)")
+    parser.add_argument('-s', '--separate', action='store_true',
+                        help="Write Detailed sheets to a separate _Detailed.xlsx file")
+    parser.add_argument('--no-detailed', action='store_true',
+                        help="Skip the Detailed sheets entirely")
+    parser.add_argument('--unformatted', action='store_true',
+                        help="Raw wide dump without client styling")
+    parser.add_argument('--config', help="JSON file overriding rules/format/source labels")
+    parser.add_argument('--gui', action='store_true', help="Launch the graphical interface")
+    args = parser.parse_args(argv)
+
+    if args.config:
+        load_config(args.config)
+
+    if args.gui:
+        import lineage_ui
+        lineage_ui.run()
+        return
+
+    inputs = args.input
+    if not inputs:
         try:
-            input_file = input("Path: ").strip()
-            if input_file.startswith('"') and input_file.endswith('"'):
-                input_file = input_file[1:-1]
+            raw = input("Path to the Atlan impact report (.csv or .xlsx): ").strip().strip('"')
         except EOFError:
+            raw = ''
+        if not raw:
             print("No input provided. Exiting.")
             sys.exit(1)
-            
-    if not input_file:
-        print("No input provided. Exiting.")
-        sys.exit(1)
+        inputs = [raw]
 
     try:
-        builder = DataLineageBuilder(input_file, output_file)
-        builder.load_data()
-        builder.preprocess_data()
-        
-        columns_to_include = ['Type', 'Database', 'Schema', 'Name']
-        
-        # 1. Build Detailed View
-        detailed_rules = TRIVIAL_RULES if TRIVIAL_RULES.get('apply_rules_to_detailed', False) else None
-        builder.build_lineage(summarize=False, trivial_rules=detailed_rules)
-        builder.apply_metadata(metadata_cols=columns_to_include)
-        detailed_df = builder.lineage.copy()
-        
-        # 2. Build Summarized View
-        builder.build_lineage(summarize=True, trivial_rules=TRIVIAL_RULES)
-        builder.apply_metadata(metadata_cols=columns_to_include)
-        summary_df = builder.lineage.copy()
-        
-        # 3. Export
-        do_format = not args.unformatted
-        export_all(detailed_df, summary_df, builder.output_file_path, args.separate, do_format)
-        
-    except Exception as e:
-        logging.error(f"Failed to process lineage: {e}")
+        written = build_workbooks(inputs, args.output,
+                                  include_detailed=not args.no_detailed,
+                                  separate_detailed=args.separate,
+                                  unformatted=args.unformatted)
+    except Exception as exc:
+        log.error("Failed to process lineage: %s", exc)
+        sys.exit(1)
+    print("Done. Output file(s):")
+    for path in written:
+        print(f"  {path}")
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
