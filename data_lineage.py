@@ -178,11 +178,21 @@ class DataLineageBuilder:
         else:
             raise ValueError("Unsupported file format, expected .csv or .xlsx")
 
+        df = self._canonicalize_columns(df)
         missing = [c for c in self.REQUIRED_COLS if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns in input: {missing}")
         self._preprocess(df)
         return self
+
+    def _canonicalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Rename input columns to the canonical names, matching case- and
+        whitespace-insensitively (e.g. 'Lineage depth' or 'Immediate Upstream ')."""
+        norm = lambda s: re.sub(r'\s+', ' ', str(s).strip()).lower()
+        lookup = {norm(c): c for c in df.columns}  # first occurrence wins
+        renames = {lookup[norm(canon)]: canon
+                   for canon in self.REQUIRED_COLS if norm(canon) in lookup}
+        return df.rename(columns=renames) if renames else df
 
     @staticmethod
     def _parse_upstream(raw) -> tuple:
