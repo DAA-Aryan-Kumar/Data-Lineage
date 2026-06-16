@@ -13,7 +13,7 @@ One workbook containing:
 | **List of Reports** | Index of every report with stats; report names link to their sheets. |
 | **\<Report name\>** | Summary lineage in the client layout: compacted tree, purple/pink headers, spacer columns, merged Query blocks, "List of sources" and "Remarks" columns. Every object is expanded **exactly once, at its lowest depth**; later occurrences are blue hyperlinks that jump to the cell where the object is fully expanded. |
 | **\<Report name\> (Detailed)** | Same layout, but every branch fully expanded (no de-duplication). |
-| **Source Tables** | One row per distinct source table across all reports — the migration worklist — with the reports that use it. |
+| **Source Tables** | One row per distinct source table across all reports — the migration worklist — with the reports that use it. Root queries that have no lineage of their own are kept but separated into a labelled section below the main table. |
 
 ## Usage
 
@@ -37,8 +37,9 @@ python data_lineage.py -i report1.xlsx [report2.csv ...] [options]
   -s, --separate      write Detailed sheets to a separate _Detailed.xlsx
   --no-detailed       skip the Detailed sheets (much faster)
   --unformatted       raw wide dump without client styling
-  --drop-no-lineage   ignore root queries that have no upstream lineage
-                      (e.g. tables hardcoded inside PowerBI)
+  --drop-no-lineage   ignore root queries that have no upstream lineage, e.g.
+                      tables hardcoded inside PowerBI (ON by default;
+                      use --no-drop-no-lineage to keep them)
   --config FILE.json  override rules / formatting / source labels
   --gui               launch the GUI
 ```

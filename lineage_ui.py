@@ -151,7 +151,7 @@ class LineageApp:
         self.opt_separate = tk.BooleanVar(value=False)
         self.opt_rules_detailed = tk.BooleanVar(value=False)
         self.opt_unformatted = tk.BooleanVar(value=False)
-        self.opt_drop_no_lineage = tk.BooleanVar(value=False)
+        self.opt_drop_no_lineage = tk.BooleanVar(value=True)
         for col, (text, var) in enumerate([
                 ("Include Detailed sheets", self.opt_detailed),
                 ("Detailed sheets in a separate file", self.opt_separate),
@@ -486,7 +486,7 @@ class LineageApp:
         self.opt_separate.set(ui.get('separate_detailed', False))
         self.opt_rules_detailed.set(rules.get('apply_rules_to_detailed', False))
         self.opt_unformatted.set(ui.get('unformatted', False))
-        self.opt_drop_no_lineage.set(ui.get('drop_no_lineage', False))
+        self.opt_drop_no_lineage.set(ui.get('drop_no_lineage', True))
 
 
 def run():

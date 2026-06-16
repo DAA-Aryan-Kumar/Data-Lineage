@@ -275,7 +275,7 @@ class DataLineageBuilder:
         return depth
 
     def build_tree(self, summarize: bool,
-                   drop_no_lineage: bool = False) -> tuple[list[Node], dict[str, Node]]:
+                   drop_no_lineage: bool = True) -> tuple[list[Node], dict[str, Node]]:
         """
         Returns (root nodes, expanded_at). In summary mode every object is
         expanded exactly once, at its minimum depth; later occurrences become
@@ -332,9 +332,18 @@ class DataLineageBuilder:
         return roots, expanded_at
 
     def source_tables(self) -> list[str]:
-        """All reachable objects that have no upstream (true sources)."""
+        """True source tables — reached objects (depth > 0) with no upstream.
+        Excludes root queries that simply have no lineage of their own; those
+        are reported separately by rootless_queries()."""
         reachable = self._min_depths(apply_rules=False)
-        return [n for n in reachable if not self.adjacency.get(n)]
+        return [n for n, depth in reachable.items()
+                if depth > 0 and not self.adjacency.get(n)]
+
+    def rootless_queries(self) -> list[str]:
+        """Root objects with no upstream lineage at all (e.g. tables hardcoded
+        inside PowerBI). These are dropped from the lineage sheets by default
+        but still listed (separately) in the Source Tables rollup."""
+        return [r for r in self.roots if not self.adjacency.get(r)]
 
 
 # ===========================================================================
@@ -353,6 +362,7 @@ class ClientExcelRenderer:
                                 else source_fallback)
         f = self.fmt
         self.font_data = Font(name=f['font_name'], size=f['font_size'])
+        self.font_data_bold = Font(name=f['font_name'], size=f['font_size'], bold=True)
         self.font_header = Font(name=f['font_name'], size=f['font_size'], bold=True,
                                 color=f['header_font_color'])
         self.font_subheader = Font(name=f['font_name'], size=f['font_size'], bold=True,
@@ -377,10 +387,13 @@ class ClientExcelRenderer:
                 best, match = prefix, label
         if best:
             return match
+        # NaN is truthy, so `value or ''` would leak the string 'nan'; guard it.
+        def clean(value):
+            return '' if value is None or (isinstance(value, float) and value != value) else str(value)
         if self.source_fallback == 'schema':
-            return str(meta.get('Schema') or '')
+            return clean(meta.get('Schema'))
         if self.source_fallback == 'db':
-            return str(meta.get('Database') or '')
+            return clean(meta.get('Database'))
         return ''
 
     @staticmethod
@@ -499,6 +512,7 @@ class ClientExcelRenderer:
         for r in (2, 3):
             for c in range(2, last_col + 1):
                 cell = ws.cell(row=r, column=c)
+                cell.alignment = self.align_center
                 if c in spacer_cols:
                     cell.fill = self.fill_white
                     cell.font = self.font_header if r == 2 else self.font_subheader
@@ -513,14 +527,15 @@ class ClientExcelRenderer:
         for c in (col_sources, col_remarks):
             ws.merge_cells(start_row=2, start_column=c, end_row=3, end_column=c)
 
-        # ---- merge query blocks (client centers these) ----
-        if self.fmt.get('merge_query_blocks', True):
-            for start, end in query_blocks:
-                if end > start:
-                    ws.merge_cells(start_row=start, start_column=col_query,
-                                   end_row=end, end_column=col_query)
-                top = ws.cell(row=start, column=col_query)
-                top.alignment = self.align_center
+        # ---- query blocks: bold + centered, optionally merged over the block ----
+        merge = self.fmt.get('merge_query_blocks', True)
+        for start, end in query_blocks:
+            if merge and end > start:
+                ws.merge_cells(start_row=start, start_column=col_query,
+                               end_row=end, end_column=col_query)
+            top = ws.cell(row=start, column=col_query)
+            top.alignment = self.align_center
+            top.font = self.font_data_bold
 
         # ---- hyperlinks: pruned duplicates -> expansion location ----
         n_links = 0
@@ -539,7 +554,13 @@ class ClientExcelRenderer:
         # ---- column widths ----
         w = self.fmt['column_widths']
         ws.column_dimensions['A'].width = w['edge']
-        ws.column_dimensions[get_column_letter(col_query)].width = w['query']
+        # Autofit the Query column to its (bold) contents. openpyxl has no real
+        # autofit, so approximate: widest query name + a little padding, with
+        # a 1.12 factor for the bold face, clamped to a sane range.
+        header_chars = len('Query')
+        content_chars = max((len(str(r.name)) for r in roots), default=header_chars)
+        query_width = min(max(content_chars * 1.12 + 2, w['query'] * 0.4), 90)
+        ws.column_dimensions[get_column_letter(col_query)].width = query_width
         for lvl in range(1, max_depth + 1):
             c = group_col(lvl)
             for off, key in enumerate(('db', 'schema', 'object', 'type')):
@@ -555,11 +576,14 @@ class ClientExcelRenderer:
                 'max_depth': max_depth, 'queries': len(roots), 'links': n_links}
 
     # -- simple styled grid (index / rollup sheets) ----------------------------
-    def _write_grid(self, ws, header: list[str], rows: list[list], widths: list[float]):
+    def _write_grid(self, ws, header: list[str], rows: list[list],
+                    widths: list[float], start_row: int = 2) -> int:
+        """Write a header + data block starting at `start_row`. Returns the last
+        row written (so callers can stack a second section below)."""
         from openpyxl.utils import get_column_letter
         ws.column_dimensions['A'].width = self.fmt['column_widths']['edge']
         for j, (text, width) in enumerate(zip(header, widths)):
-            cell = ws.cell(row=2, column=2 + j, value=text)
+            cell = ws.cell(row=start_row, column=2 + j, value=text)
             cell.fill = self.fill_index
             cell.font = self.font_data
             if self.border:
@@ -567,10 +591,11 @@ class ClientExcelRenderer:
             ws.column_dimensions[get_column_letter(2 + j)].width = width
         for i, row in enumerate(rows):
             for j, value in enumerate(row):
-                cell = ws.cell(row=3 + i, column=2 + j, value=value)
+                cell = ws.cell(row=start_row + 1 + i, column=2 + j, value=value)
                 cell.font = self.font_data
                 if self.border:
                     cell.border = self.border
+        return start_row + len(rows)  # last row written (header if no rows)
 
 
 # ===========================================================================
@@ -580,7 +605,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
                     rules: dict | None = None, fmt: dict | None = None,
                     source_labels: dict | None = None, source_fallback: str | None = None,
                     include_detailed: bool = True, separate_detailed: bool = False,
-                    unformatted: bool = False, drop_no_lineage: bool = False,
+                    unformatted: bool = False, drop_no_lineage: bool = True,
                     progress=None) -> list[str]:
     """Process every input file and write the output workbook(s).
     Returns the list of files written. `progress` is an optional callback(str).
@@ -682,22 +707,45 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
 
 
 def _add_source_rollup(wb, renderer: ClientExcelRenderer, reports: list[dict]):
-    """One row per distinct source table across all reports — the migration worklist."""
-    usage: dict[str, dict] = {}
-    for rep in reports:
-        builder = rep['builder']
-        for name in builder.source_tables():
-            entry = usage.setdefault(name, {'meta': builder.object_meta(name), 'reports': []})
-            entry['reports'].append(builder.report_name)
-    rows = []
-    for name in sorted(usage):
-        meta, reps = usage[name]['meta'], usage[name]['reports']
-        rows.append([meta['Database'], meta['Schema'], meta['Name'], meta['Type'],
-                     renderer.source_label(name, meta), len(reps), ', '.join(sorted(set(reps)))])
+    """Source-table rollup across all reports. The real source tables (the
+    migration worklist) come first; root queries that have no lineage of their
+    own are kept but separated into a labelled section below."""
+    def collect(getter, exclude=frozenset()) -> tuple[list[list], set]:
+        usage: dict[str, dict] = {}
+        for rep in reports:
+            builder = rep['builder']
+            for name in getter(builder):
+                if name in exclude:
+                    continue
+                entry = usage.setdefault(name, {'meta': builder.object_meta(name), 'reports': []})
+                entry['reports'].append(builder.report_name)
+        rows = []
+        for name in sorted(usage):
+            meta, reps = usage[name]['meta'], usage[name]['reports']
+            rows.append([meta['Database'], meta['Schema'], meta['Name'], meta['Type'],
+                         renderer.source_label(name, meta), len(reps),
+                         ', '.join(sorted(set(reps)))])
+        return rows, set(usage)
+
+    sources, source_names = collect(lambda b: b.source_tables())
+    # A name that is a real source in any report belongs in the worklist above,
+    # never the rootless section — even if another report has it as a root.
+    rootless, _ = collect(lambda b: b.rootless_queries(), exclude=source_names)
+    header = ['db', 'schema', 'object', 'type', 'List of sources',
+              'Used by # reports', 'Reports']
+    widths = [24, 18, 40, 8, 19, 16, 60]
+
     ws = wb.create_sheet('Source Tables')
-    renderer._write_grid(ws, ['db', 'schema', 'object', 'type', 'List of sources',
-                              'Used by # reports', 'Reports'],
-                         rows, [24, 18, 40, 8, 19, 16, 60])
+    # Skip the real-sources header entirely if there are none (e.g. an
+    # all-rootless report), so the rootless section isn't preceded by an
+    # empty orphan header.
+    last = renderer._write_grid(ws, header, sources, widths) if sources else 1
+    if rootless:
+        title_row = last + 2  # one blank spacer row, then a section label
+        label = ws.cell(row=title_row, column=2,
+                        value='Queries with no upstream lineage (not migrated)')
+        label.font = renderer.font_data_bold
+        renderer._write_grid(ws, header, rootless, widths, start_row=title_row + 1)
 
 
 def _export_unformatted(reports: list[dict], output_path: str) -> str:
@@ -799,9 +847,11 @@ def main(argv=None):
                         help="Skip the Detailed sheets entirely")
     parser.add_argument('--unformatted', action='store_true',
                         help="Raw wide dump without client styling")
-    parser.add_argument('--drop-no-lineage', action='store_true',
+    parser.add_argument('--drop-no-lineage', action=argparse.BooleanOptionalAction,
+                        default=True,
                         help="Ignore root queries that have no upstream lineage "
-                             "(e.g. tables hardcoded inside PowerBI)")
+                             "(e.g. tables hardcoded inside PowerBI). On by default; "
+                             "use --no-drop-no-lineage to keep them.")
     parser.add_argument('--config', help="JSON file overriding rules/format/source labels")
     parser.add_argument('--gui', action='store_true', help="Launch the graphical interface")
     args = parser.parse_args(argv)
