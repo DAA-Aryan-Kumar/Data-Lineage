@@ -23,7 +23,19 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import data_lineage as engine
+try:
+    import data_lineage as engine
+except ImportError as exc:
+    # Launched (e.g. by pythonw) on an interpreter missing pandas/openpyxl —
+    # there's no console to show the traceback, so surface it as a dialog.
+    _root = tk.Tk()
+    _root.withdraw()
+    messagebox.showerror(
+        "Missing Python library",
+        f"The Data Lineage Builder could not start because a required "
+        f"library is missing:\n\n    {exc}\n\n"
+        f"Install the dependencies with:\n\n    pip install pandas openpyxl")
+    raise SystemExit(1)
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              'lineage_settings.json')
