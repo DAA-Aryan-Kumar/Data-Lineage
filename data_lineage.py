@@ -206,7 +206,10 @@ class DataLineageBuilder:
         return tuple(dict.fromkeys(names))  # de-dupe, keep order
 
     def _preprocess(self, df: pd.DataFrame):
-        is_pbi = df['Connector'].eq('powerbi')
+        # Match the connector case-insensitively: Atlan exports vary between
+        # 'powerbi' and 'Powerbi'. PowerBI objects have no Database/Schema, so
+        # they use their bare Name; everything else is Database.Schema.Name.
+        is_pbi = df['Connector'].astype(str).str.strip().str.lower().eq('powerbi')
         full = (df['Database'].astype(str) + '.' + df['Schema'].astype(str)
                 + '.' + df['Name'].astype(str))
         df = df.assign(**{'Consolidated Name': full.where(~is_pbi, df['Name'])})
