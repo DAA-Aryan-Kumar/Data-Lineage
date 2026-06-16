@@ -274,11 +274,16 @@ class DataLineageBuilder:
                     queue.append(child)
         return depth
 
-    def build_tree(self, summarize: bool) -> tuple[list[Node], dict[str, Node]]:
+    def build_tree(self, summarize: bool,
+                   drop_no_lineage: bool = False) -> tuple[list[Node], dict[str, Node]]:
         """
         Returns (root nodes, expanded_at). In summary mode every object is
         expanded exactly once, at its minimum depth; later occurrences become
         ST_DUP leaves pointing back at the expansion (via expanded_at).
+
+        If drop_no_lineage is True, root objects with no upstream at all
+        (e.g. tables hard-coded inside PowerBI) are omitted entirely rather
+        than emitted as a lone Query row.
         """
         sys.setrecursionlimit(max(sys.getrecursionlimit(), 50_000))
         apply_rules = summarize or self.rules.get('apply_rules_to_detailed', False)
@@ -312,11 +317,18 @@ class DataLineageBuilder:
             node.children = [make(c, level + 1, child_path) for c in kids]
             return node
 
-        roots = [make(r, 0, frozenset()) for r in self.roots]
+        root_names = self.roots
+        if drop_no_lineage:
+            root_names = [r for r in self.roots if self.adjacency.get(r)]
+            dropped = len(self.roots) - len(root_names)
+            if dropped:
+                log.info("  Ignoring %d root object(s) with no upstream lineage", dropped)
+
+        roots = [make(r, 0, frozenset()) for r in root_names]
         mode = 'summary' if summarize else 'detailed'
         log.info("  Built %s tree: %d rows, max depth L%d", mode,
                  sum(1 for r in roots for _ in r.leaves()),
-                 max(r.max_level() for r in roots))
+                 max((r.max_level() for r in roots), default=0))
         return roots, expanded_at
 
     def source_tables(self) -> list[str]:
@@ -391,7 +403,7 @@ class ClientExcelRenderer:
         from openpyxl.worksheet.hyperlink import Hyperlink
 
         ws = wb.create_sheet(title)
-        max_depth = max(1, max(r.max_level() for r in roots))
+        max_depth = max([1] + [r.max_level() for r in roots])
 
         col_query = 2
         group_col = lambda lvl: 3 + 5 * (lvl - 1)          # db col of level group
@@ -568,9 +580,13 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
                     rules: dict | None = None, fmt: dict | None = None,
                     source_labels: dict | None = None, source_fallback: str | None = None,
                     include_detailed: bool = True, separate_detailed: bool = False,
-                    unformatted: bool = False, progress=None) -> list[str]:
+                    unformatted: bool = False, drop_no_lineage: bool = False,
+                    progress=None) -> list[str]:
     """Process every input file and write the output workbook(s).
-    Returns the list of files written. `progress` is an optional callback(str)."""
+    Returns the list of files written. `progress` is an optional callback(str).
+
+    drop_no_lineage: skip root queries that have no upstream lineage at all
+    (e.g. tables hardcoded inside PowerBI) — they otherwise add a noise row."""
     import openpyxl
 
     def report_progress(msg):
@@ -593,8 +609,10 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     for path in input_files:
         builder = DataLineageBuilder(path, rules=rules).load()
         report_progress(f"Tracing lineage: {builder.report_name}")
-        summary_roots, expanded_at = builder.build_tree(summarize=True)
-        detailed = builder.build_tree(summarize=False) if include_detailed else (None, None)
+        summary_roots, expanded_at = builder.build_tree(
+            summarize=True, drop_no_lineage=drop_no_lineage)
+        detailed = (builder.build_tree(summarize=False, drop_no_lineage=drop_no_lineage)
+                    if include_detailed else (None, None))
         reports.append({'builder': builder, 'summary': (summary_roots, expanded_at),
                         'detailed': detailed})
 
@@ -781,6 +799,9 @@ def main(argv=None):
                         help="Skip the Detailed sheets entirely")
     parser.add_argument('--unformatted', action='store_true',
                         help="Raw wide dump without client styling")
+    parser.add_argument('--drop-no-lineage', action='store_true',
+                        help="Ignore root queries that have no upstream lineage "
+                             "(e.g. tables hardcoded inside PowerBI)")
     parser.add_argument('--config', help="JSON file overriding rules/format/source labels")
     parser.add_argument('--gui', action='store_true', help="Launch the graphical interface")
     args = parser.parse_args(argv)
@@ -808,7 +829,8 @@ def main(argv=None):
         written = build_workbooks(inputs, args.output,
                                   include_detailed=not args.no_detailed,
                                   separate_detailed=args.separate,
-                                  unformatted=args.unformatted)
+                                  unformatted=args.unformatted,
+                                  drop_no_lineage=args.drop_no_lineage)
     except Exception as exc:
         log.error("Failed to process lineage: %s", exc)
         sys.exit(1)

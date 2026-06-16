@@ -37,6 +37,8 @@ python data_lineage.py -i report1.xlsx [report2.csv ...] [options]
   -s, --separate      write Detailed sheets to a separate _Detailed.xlsx
   --no-detailed       skip the Detailed sheets (much faster)
   --unformatted       raw wide dump without client styling
+  --drop-no-lineage   ignore root queries that have no upstream lineage
+                      (e.g. tables hardcoded inside PowerBI)
   --config FILE.json  override rules / formatting / source labels
   --gui               launch the GUI
 ```

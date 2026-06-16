@@ -151,11 +151,13 @@ class LineageApp:
         self.opt_separate = tk.BooleanVar(value=False)
         self.opt_rules_detailed = tk.BooleanVar(value=False)
         self.opt_unformatted = tk.BooleanVar(value=False)
+        self.opt_drop_no_lineage = tk.BooleanVar(value=False)
         for col, (text, var) in enumerate([
                 ("Include Detailed sheets", self.opt_detailed),
                 ("Detailed sheets in a separate file", self.opt_separate),
                 ("Apply pruning rules to Detailed", self.opt_rules_detailed),
-                ("Unformatted raw export", self.opt_unformatted)]):
+                ("Unformatted raw export", self.opt_unformatted),
+                ("Ignore queries with no upstream lineage", self.opt_drop_no_lineage)]):
             ttk.Checkbutton(opts, text=text, variable=var).grid(
                 row=col // 2, column=col % 2, sticky='w', padx=6, pady=2)
 
@@ -354,6 +356,7 @@ class LineageApp:
             include_detailed=self.opt_detailed.get(),
             separate_detailed=self.opt_separate.get(),
             unformatted=self.opt_unformatted.get(),
+            drop_no_lineage=self.opt_drop_no_lineage.get(),
         )
         self.worker = threading.Thread(target=self._worker_main, args=(kwargs,), daemon=True)
         self.worker.start()
@@ -430,6 +433,7 @@ class LineageApp:
                 'include_detailed': self.opt_detailed.get(),
                 'separate_detailed': self.opt_separate.get(),
                 'unformatted': self.opt_unformatted.get(),
+                'drop_no_lineage': self.opt_drop_no_lineage.get(),
             },
         }
         try:
@@ -482,6 +486,7 @@ class LineageApp:
         self.opt_separate.set(ui.get('separate_detailed', False))
         self.opt_rules_detailed.set(rules.get('apply_rules_to_detailed', False))
         self.opt_unformatted.set(ui.get('unformatted', False))
+        self.opt_drop_no_lineage.set(ui.get('drop_no_lineage', False))
 
 
 def run():
