@@ -61,6 +61,7 @@ class LineageApp:
         root.title("Data Lineage Builder")
         root.geometry("980x720")
         root.minsize(840, 600)
+        self._set_window_icon()
 
         self.log_queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -70,6 +71,17 @@ class LineageApp:
         self._build_layout()
         self._load_settings()
         self._poll_log_queue()
+
+    def _set_window_icon(self):
+        """Use app.ico for the title-bar icon (matches any packaged .exe icon).
+        Resolves from a PyInstaller bundle (sys._MEIPASS) or a plain checkout."""
+        try:
+            base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+            ico = os.path.join(base, 'app.ico')
+            if os.path.exists(ico):
+                self.root.iconbitmap(ico)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ UI --
     def _build_styles(self):
