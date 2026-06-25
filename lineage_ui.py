@@ -37,8 +37,11 @@ except ImportError as exc:
         f"Install the dependencies with:\n\n    pip install pandas openpyxl")
     raise SystemExit(1)
 
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             'lineage_settings.json')
+# When frozen by PyInstaller, __file__ lives in a temp extraction dir, so keep
+# the settings next to the executable instead (a stable, writable location).
+_APP_DIR = (os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+            else os.path.dirname(os.path.abspath(__file__)))
+SETTINGS_FILE = os.path.join(_APP_DIR, 'lineage_settings.json')
 
 ACCENT = '#7030A0'        # client purple
 ACCENT_LIGHT = '#F2CEEF'  # client pink
@@ -123,6 +126,43 @@ class LineageApp:
         self.open_file_btn = ttk.Button(bar, text="Open workbook",
                                         command=self._open_file, state='disabled')
         self.open_file_btn.pack(side='right', padx=6)
+
+        self._add_watermark()
+
+    def _watermark_text(self) -> str:
+        """Optional corner watermark, OFF by default. Enabled (e.g. "AK") via,
+        in order of precedence: the LINEAGE_WATERMARK env var, a 'watermark.txt'
+        bundled into a packaged build, or a 'watermark' key in the local
+        settings file. Lets one codebase produce a plain or watermarked build."""
+        txt = os.environ.get('LINEAGE_WATERMARK', '').strip()
+        if txt:
+            return txt
+        if getattr(sys, 'frozen', False):
+            bundled = os.path.join(getattr(sys, '_MEIPASS', ''), 'watermark.txt')
+            try:
+                if os.path.exists(bundled):
+                    with open(bundled, encoding='utf-8') as fh:
+                        return fh.read().strip()
+            except OSError:
+                pass
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, encoding='utf-8') as fh:
+                    return str(json.load(fh).get('watermark', '')).strip()
+        except (OSError, json.JSONDecodeError):
+            pass
+        return ''
+
+    def _add_watermark(self):
+        """Draw a small, muted maker's mark in the top-right corner if one is
+        configured (see _watermark_text). No-op otherwise."""
+        text = self._watermark_text()
+        if not text:
+            return
+        mark = tk.Label(self.root, text=text, font=('Segoe UI', 8),
+                        foreground='#C2C2C2', background=self.root.cget('background'))
+        mark.place(relx=1.0, rely=0.0, x=-10, y=6, anchor='ne')
+        mark.lift()
 
     # ---- tab 1: run ----------------------------------------------------------
     def _build_run_tab(self):

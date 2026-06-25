@@ -46,6 +46,23 @@ python data_lineage.py -i report1.xlsx [report2.csv ...] [options]
 
 With no arguments it prompts for an input path interactively.
 
+### Standalone executable (optional)
+
+`lineage_app.py` is a single entry point that can be packaged into one
+Windows `.exe` (no Python needed on the target machine). The same binary
+serves both modes: **no arguments → GUI** (it prints a short loading line and
+hides its own console once the window is up), **arguments → CLI** (attaches to
+the calling terminal). Build it with PyInstaller:
+
+```
+pyinstaller --onefile --console --name "Data Lineage Builder" ^
+  --icon app.ico --add-data "app.ico;." lineage_app.py
+```
+
+(The repo `.gitignore` excludes the generated `.exe`, `build/`, and `dist/`.)
+For a watermarked personal build, add `--add-data "watermark.txt;."` where
+`watermark.txt` contains the mark text (see below).
+
 ## Configuration
 
 Defaults live at the top of `data_lineage.py`; anything can be overridden
@@ -61,6 +78,15 @@ same schema):
 * **`SOURCE_LABELS`** — prefix → label map for the "List of sources" column
   (e.g. `PROD_DATALAKE.CRM_MSCRM` → `CRM`); `SOURCE_LABEL_FALLBACK` picks
   what to show when nothing matches (`schema`, `db` or `blank`).
+* **Watermark** — a small muted mark in the GUI's top-right corner, **off by
+  default**. Turn it on (without forking the code) via any of, in priority
+  order: the `LINEAGE_WATERMARK` environment variable, a `watermark.txt`
+  bundled into a packaged `.exe`, or a `"watermark"` key in
+  `lineage_settings.json`. This is how the personal "AK" build is produced
+  from the same source.
+
+The app icon is `app.ico` (vector master `app.svg`); it is used for both the
+window title bar and the packaged `.exe`.
 
 ## Requirements
 

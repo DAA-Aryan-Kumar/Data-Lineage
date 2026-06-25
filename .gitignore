@@ -8,3 +8,10 @@ lineage_settings.json
 *__lineage.xlsx
 *_Detailed.xlsx
 Data Lineage Report*.xlsx
+
+# PyInstaller / packaged executable artifacts
+build/
+dist/
+*.spec
+*.exe
+watermark.txt
