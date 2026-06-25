@@ -63,6 +63,23 @@ pyinstaller --onefile --console --name "Data Lineage Builder" ^
 For a watermarked personal build, add `--add-data "watermark.txt;."` where
 `watermark.txt` contains the mark text (see below).
 
+**Tip — build a *small* exe.** PyInstaller bundles whatever is in the build
+environment. Building from an Anaconda base produces a ~250 MB exe because its
+NumPy links Intel MKL. Building from a clean pip venv (NumPy ships the much
+smaller OpenBLAS) yields a ~38 MB exe with identical behaviour:
+
+```
+py -m venv buildenv
+buildenv\Scripts\activate
+pip install "pandas==2.2.3" openpyxl lxml pyinstaller   # pin pandas 2.x
+pyinstaller --onefile --console --name "Data Lineage Builder" ^
+  --icon app.ico --add-data "app.ico;." lineage_app.py
+```
+
+The build machine needs Python; the resulting `.exe` does not. (If that venv
+is created from a *conda* Python, also put `…\anaconda3\Library\bin` on `PATH`
+during the build so PyInstaller can find `ffi-8.dll` for `_ctypes`.)
+
 ## Configuration
 
 Defaults live at the top of `data_lineage.py`; anything can be overridden
