@@ -204,6 +204,74 @@ def derive_report_name(path: str) -> str:
     return stem.strip(' _-') or stem
 
 
+_CANON_COLS = ('Name', 'Database', 'Schema', 'Type', 'Connector', 'Lineage Depth',
+               'Immediate upstream', 'Immediate downstream')
+
+
+def _canon_cols(df):
+    """Rename input columns to canonical names, matching case/whitespace-
+    insensitively (e.g. 'Lineage depth', 'Immediate Downstream ')."""
+    norm = lambda s: re.sub(r'\s+', ' ', str(s).strip()).lower()
+    lookup = {norm(c): c for c in df.columns}        # first occurrence wins
+    renames = {lookup[norm(c)]: c for c in _CANON_COLS if norm(c) in lookup}
+    return df.rename(columns=renames) if renames else df
+
+
+def _downstream_names(raw) -> list:
+    """Readable names from an Atlan 'Name (default/.../id), Other (...)' value
+    (the text before each parenthesised qualified name)."""
+    if not isinstance(raw, str):
+        return []
+    out = []
+    for nm in re.findall(r'([^(]+?)\s*\([^)]*\)', raw):
+        nm = nm.strip().strip(',').strip()
+        if nm:
+            out.append(nm)
+    return out
+
+
+def _data_report_name(df, fallback: str) -> str:
+    """Derive the report's name from its own data, falling back to `fallback`
+    (the filename-based name) when the data is ambiguous:
+      * dashboard export -> the PowerBI root rows' shared downstream container
+        (e.g. 'ATS Pilot Dashboard'), so a renamed input file still names right;
+      * table-level export -> the single root object's Name (e.g. 'BRANCH_DIM')."""
+    if 'Lineage Depth' not in df.columns or 'Name' not in df.columns:
+        return fallback
+    depth = pd.to_numeric(df['Lineage Depth'], errors='coerce')
+    if depth.notna().sum() == 0:
+        return fallback
+    root = depth.eq(depth.min())
+    is_pbi = (df['Connector'].astype(str).str.strip().str.lower().eq('powerbi')
+              if 'Connector' in df.columns else pd.Series(False, index=df.index))
+    if 'Immediate downstream' in df.columns:
+        names = []
+        for raw in df.loc[root & is_pbi, 'Immediate downstream']:
+            names.extend(_downstream_names(raw))
+        if names:
+            from collections import Counter
+            return Counter(names).most_common(1)[0][0]
+    distinct = [n for n in dict.fromkeys(df.loc[root, 'Name'].astype(str).map(str.strip))
+                if n and n.lower() != 'nan']
+    return distinct[0] if len(distinct) == 1 else fallback
+
+
+def peek_report_name(path: str) -> str:
+    """Cheap data-driven name for `path` without building the lineage graph
+    (used to assign merge sheet names before the parallel render)."""
+    fallback = derive_report_name(path)
+    try:
+        if path.lower().endswith('.xlsx'):
+            df = pd.read_excel(path)
+        elif path.lower().endswith('.csv'):
+            df = pd.read_csv(path)
+        else:
+            return fallback
+        return _data_report_name(_canon_cols(df), fallback)
+    except Exception:
+        return fallback
+
+
 # ===========================================================================
 # LINEAGE ENGINE
 # ===========================================================================
@@ -236,21 +304,12 @@ class DataLineageBuilder:
         else:
             raise ValueError("Unsupported file format, expected .csv or .xlsx")
 
-        df = self._canonicalize_columns(df)
+        df = _canon_cols(df)
         missing = [c for c in self.REQUIRED_COLS if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns in input: {missing}")
         self._preprocess(df)
         return self
-
-    def _canonicalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Rename input columns to the canonical names, matching case- and
-        whitespace-insensitively (e.g. 'Lineage depth' or 'Immediate Upstream ')."""
-        norm = lambda s: re.sub(r'\s+', ' ', str(s).strip()).lower()
-        lookup = {norm(c): c for c in df.columns}  # first occurrence wins
-        renames = {lookup[norm(canon)]: canon
-                   for canon in self.REQUIRED_COLS if norm(canon) in lookup}
-        return df.rename(columns=renames) if renames else df
 
     @staticmethod
     def _parse_upstream(raw) -> tuple:
@@ -285,6 +344,9 @@ class DataLineageBuilder:
         min_depth = df['Lineage Depth'].min()
         self.roots = first.loc[first['Lineage Depth'] == min_depth,
                                'Consolidated Name'].tolist()
+        # Name the report from its own data (dashboard downstream / root object),
+        # keeping the filename-derived name only as a fallback.
+        self.report_name = _data_report_name(df, self.report_name)
         log.info("  %d objects, %d roots (depth %s), %d with upstream",
                  len(first), len(self.roots), min_depth, len(self.adjacency))
 
@@ -856,7 +918,7 @@ def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallba
     taken = {'list of reports', 'source tables'}
     tasks = []
     for path, out_path in zip(input_files, out_paths):
-        name = derive_report_name(path)
+        name = peek_report_name(path)   # data-driven, matches the child's name
         s_sheet = ClientExcelRenderer.safe_sheet_name(name, taken)
         d_sheet = (ClientExcelRenderer.safe_sheet_name(name, taken, suffix=' (Detailed)')
                    if include_detailed else None)
@@ -1122,10 +1184,13 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         raise ValueError("No input files provided.")
     if output_path is None:
         first = os.path.abspath(input_files[0])
-        # A single report names itself after the dashboard; only a true
-        # multi-report combine gets the generic workbook name.
-        default = (f'{derive_report_name(first)}.xlsx' if len(input_files) == 1
-                   else 'Data Lineage Workbook.xlsx')
+        # A single report names itself after its dashboard/table (data-driven);
+        # only a true multi-report combine gets the generic workbook name.
+        if len(input_files) == 1:
+            safe = re.sub(r'[\\/:*?"<>|]', ' ', peek_report_name(first)).strip()
+            default = f'{safe or "Data Lineage Workbook"}.xlsx'
+        else:
+            default = 'Data Lineage Workbook.xlsx'
         output_path = os.path.join(os.path.dirname(first), default)
     output_path = os.path.abspath(output_path)
 

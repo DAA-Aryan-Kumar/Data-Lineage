@@ -319,8 +319,9 @@ class LineageApp:
         ttk.Entry(out_frame, textvariable=self.output_var).pack(
             side='left', fill='x', expand=True, padx=8)
         ttk.Button(out_frame, text="Browse…", command=self._pick_output).pack(side='left')
-        ttk.Label(tab, text="Leave blank to save as \"Data Lineage Workbook.xlsx\" "
-                            "next to the first input file.",
+        ttk.Label(tab, text="Leave blank to auto-name the output next to the first input "
+                            "file — a single report after its dashboard/table, a combined "
+                            "workbook as \"Data Lineage Workbook.xlsx\".",
                   style='Sub.TLabel').pack(anchor='w')
 
         self.opt_detailed = tk.BooleanVar(value=True)
