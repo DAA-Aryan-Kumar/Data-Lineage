@@ -198,17 +198,17 @@ class LineageApp:
                             "next to the first input file.",
                   style='Sub.TLabel').pack(anchor='w')
 
-        opts = ttk.LabelFrame(tab, text="Options", padding=8)
+        opts = ttk.LabelFrame(tab, text="Detailed sheets", padding=8)
         opts.pack(fill='x', pady=(10, 0))
         self.opt_detailed = tk.BooleanVar(value=True)
         self.opt_separate = tk.BooleanVar(value=False)
-        self.opt_drop_no_lineage = tk.BooleanVar(value=True)
-        for col, (text, var) in enumerate([
-                ("Include Detailed sheets", self.opt_detailed),
-                ("Detailed sheets in a separate file", self.opt_separate),
-                ("Ignore queries with no upstream lineage", self.opt_drop_no_lineage)]):
-            ttk.Checkbutton(opts, text=text, variable=var).grid(
-                row=col // 2, column=col % 2, sticky='w', padx=6, pady=2)
+        ttk.Checkbutton(opts, text="Include Detailed sheets", variable=self.opt_detailed
+                        ).grid(row=0, column=0, sticky='w', padx=6, pady=2)
+        self.sep_cb = ttk.Checkbutton(opts, text="Detailed sheets in a separate file",
+                                      variable=self.opt_separate)
+        self.sep_cb.grid(row=0, column=1, sticky='w', padx=6, pady=2)
+        self.opt_detailed.trace_add('write', self._toggle_detailed)
+        self._toggle_detailed()
 
         actions = ttk.Frame(tab)
         actions.pack(fill='x', pady=12)
@@ -227,18 +227,40 @@ class LineageApp:
         log_scroll.pack(side='left', fill='y')
         self.log_text.config(yscrollcommand=log_scroll.set)
 
+    def _toggle_detailed(self, *_):
+        """Disable the 'separate file' option when Detailed sheets are off."""
+        self.sep_cb.configure(state='normal' if self.opt_detailed.get() else 'disabled')
+
     # ---- tab 2: pruning rules -------------------------------------------------
     def _build_rules_tab(self):
         tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(tab, text='  Pruning Rules  ')
+
+        # --- per-sheet toggles at the top ---
+        self.drop_summary = tk.BooleanVar(value=True)
+        self.drop_detailed = tk.BooleanVar(value=True)
+        self.apply_summary = tk.BooleanVar(value=True)
+        self.apply_detailed = tk.BooleanVar(value=False)
+        toggles = ttk.Frame(tab)
+        toggles.pack(fill='x', pady=(0, 8))
+        for r, (label, sv, dv) in enumerate([
+                ("Ignore queries with no upstream lineage:", self.drop_summary, self.drop_detailed),
+                ("Apply the pruning rules below:", self.apply_summary, self.apply_detailed)]):
+            ttk.Label(toggles, text=label).grid(row=r, column=0, sticky='w', pady=2)
+            ttk.Checkbutton(toggles, text="Summary", variable=sv).grid(
+                row=r, column=1, sticky='w', padx=(12, 8))
+            ttk.Checkbutton(toggles, text="Detailed", variable=dv).grid(
+                row=r, column=2, sticky='w')
+
         ttk.Label(
             tab,
-            text="Trim noise from the lineage. Each box takes one glob pattern "
-                 "per line, matched against DATABASE.SCHEMA.OBJECT "
-                 "(e.g.  *.DATAWAREHOUSE.*,  PROD_*.*.BRANCH*,  *.CRM*.* ). "
-                 "Entries with fewer than three segments auto-fill with * "
-                 "(TEMP_DB = TEMP_DB.*.*,  DB.SCHEMA = DB.SCHEMA.*).",
-            style='Sub.TLabel', wraplength=900, justify='left').pack(anchor='w', pady=(0, 8))
+            text="Each box takes one glob pattern per line, matched against "
+                 "DATABASE.SCHEMA.OBJECT (e.g.  *.DATAWAREHOUSE.*,  PROD_*.*.BRANCH*,  "
+                 "*.CRM*.* ). Fewer than three segments auto-fill with * "
+                 "(TEMP_DB = TEMP_DB.*.*). Matching ignores case unless you quote "
+                 'the entry, e.g.  "PROD_DATALAKE.LAWPROD.attrep_changes*"  '
+                 "(for case-sensitive Snowflake quoted identifiers).",
+            style='Sub.TLabel', wraplength=920, justify='left').pack(anchor='w', pady=(0, 8))
 
         grid = ttk.Frame(tab)
         grid.pack(fill='both', expand=True)
@@ -246,12 +268,7 @@ class LineageApp:
             grid.columnconfigure(i, weight=1, uniform='rules')
             grid.rowconfigure(i, weight=1)
 
-        self.ex_case = tk.BooleanVar(value=False)
-        self.blk_case = tk.BooleanVar(value=False)
-        self.tbl_case = tk.BooleanVar(value=False)
-        self.vw_case = tk.BooleanVar(value=False)
-
-        def make_section(r, c, title, info, case_var, level_var=None):
+        def make_section(r, c, title, info, level_var=None):
             f = ttk.LabelFrame(grid, text=title, padding=8)
             f.grid(row=r, column=c, sticky='nsew',
                    padx=(0, 5) if c == 0 else (5, 0),
@@ -266,36 +283,25 @@ class LineageApp:
                 ttk.Spinbox(row, from_=0, to=99, width=4,
                             textvariable=level_var).pack(side='left', padx=4)
             txt = tk.Text(f, height=6, font=('Consolas', 9))
-            txt.pack(fill='both', expand=True, pady=(4, 2))
-            ttk.Checkbutton(f, text="Match case (exact — for quoted identifiers)",
-                            variable=case_var).pack(anchor='w')
+            txt.pack(fill='both', expand=True, pady=(4, 0))
             return txt
 
         self.rule_tbl_limit = tk.IntVar(value=8)
         self.rule_vw_limit = tk.IntVar(value=8)
         self.ex_text = make_section(
             0, 0, "Exclude entirely",
-            "Hidden from the output and not expanded.", self.ex_case)
+            "Hidden from the output and not expanded.")
         self.blk_text = make_section(
             0, 1, "Block expansion",
-            "Shown in the output, but upstream is not expanded.", self.blk_case)
+            "Shown in the output, but upstream is not expanded.")
         self.tbl_text = make_section(
             1, 0, "Stop expanding tables",
             "Matching TABLES shown but not expanded beyond level",
-            self.tbl_case, self.rule_tbl_limit)
+            self.rule_tbl_limit)
         self.vw_text = make_section(
             1, 1, "Stop expanding views",
             "Matching VIEWS shown but not expanded beyond level",
-            self.vw_case, self.rule_vw_limit)
-
-        apply_row = ttk.Frame(tab)
-        apply_row.pack(fill='x', pady=(10, 0))
-        self.apply_summary = tk.BooleanVar(value=True)
-        self.apply_detailed = tk.BooleanVar(value=False)
-        ttk.Checkbutton(apply_row, text="Apply pruning rules to Summary sheets",
-                        variable=self.apply_summary).pack(side='left', padx=(0, 18))
-        ttk.Checkbutton(apply_row, text="Apply pruning rules to Detailed sheets",
-                        variable=self.apply_detailed).pack(side='left')
+            self.rule_vw_limit)
 
     # ---- tab 3: formatting & sources -----------------------------------------
     def _build_format_tab(self):
@@ -340,8 +346,9 @@ class LineageApp:
         self._fmt_lockable += [e1, e2, e3]
 
         src = ttk.LabelFrame(
-            tab, text='"List of sources" labels — glob = label, one per line, '
-                      'first match wins (e.g.  *.CRM_MSCRM.* = CRM)', padding=8)
+            tab, text='"List of sources" labels — glob = label, one per line, first '
+                      'match wins (e.g.  *.CRM_MSCRM.* = CRM ; quote for case-sensitive)',
+            padding=8)
         src.pack(fill='both', expand=True, pady=(10, 0))
         self.src_text = tk.Text(src, height=8, font=('Consolas', 9))
         self.src_text.pack(fill='both', expand=True)
@@ -352,9 +359,6 @@ class LineageApp:
         ttk.Combobox(fb_row, textvariable=self.src_fallback, width=10,
                      values=('schema', 'db', 'blank'), state='readonly'
                      ).pack(side='left', padx=6)
-        self.src_case = tk.BooleanVar(value=False)
-        ttk.Checkbutton(fb_row, text="Match case", variable=self.src_case).pack(
-            side='left', padx=(14, 0))
 
         self.opt_unformatted.trace_add('write', self._toggle_unformatted)
         self._toggle_unformatted()
@@ -406,15 +410,13 @@ class LineageApp:
             return [ln.strip() for ln in widget.get('1.0', 'end').splitlines() if ln.strip()]
         return {
             'exclude_patterns': lines(self.ex_text),
-            'exclude_match_case': self.ex_case.get(),
             'block_patterns': lines(self.blk_text),
-            'block_match_case': self.blk_case.get(),
             'table_patterns': lines(self.tbl_text),
             'table_level': self.rule_tbl_limit.get(),
-            'table_match_case': self.tbl_case.get(),
             'view_patterns': lines(self.vw_text),
             'view_level': self.rule_vw_limit.get(),
-            'view_match_case': self.vw_case.get(),
+            'drop_no_lineage_summary': self.drop_summary.get(),
+            'drop_no_lineage_detailed': self.drop_detailed.get(),
             'apply_to_summary': self.apply_summary.get(),
             'apply_to_detailed': self.apply_detailed.get(),
         }
@@ -465,11 +467,9 @@ class LineageApp:
             fmt=self._collect_format(),
             source_labels=self._collect_source_labels(),
             source_fallback=self.src_fallback.get(),
-            source_match_case=self.src_case.get(),
             include_detailed=self.opt_detailed.get(),
             separate_detailed=self.opt_separate.get(),
             unformatted=self.opt_unformatted.get(),
-            drop_no_lineage=self.opt_drop_no_lineage.get(),
         )
         self.worker = threading.Thread(target=self._worker_main, args=(kwargs,), daemon=True)
         self.worker.start()
@@ -540,14 +540,12 @@ class LineageApp:
             'excel_format': self._collect_format(),
             'source_labels': self._collect_source_labels(),
             'source_label_fallback': self.src_fallback.get(),
-            'source_label_match_case': self.src_case.get(),
             'ui': {
                 'files': list(self._files),
                 'output': self.output_var.get(),
                 'include_detailed': self.opt_detailed.get(),
                 'separate_detailed': self.opt_separate.get(),
                 'unformatted': self.opt_unformatted.get(),
-                'drop_no_lineage': self.opt_drop_no_lineage.get(),
             },
         }
         try:
@@ -578,22 +576,19 @@ class LineageApp:
                 self.fmt_sub_fill.set(fmt.get('subheader_fill', 'F2CEEF'))
                 self.fmt_font.set(fmt.get('font_name', 'Messina Sans'))
                 self.src_fallback.set(cfg.get('source_label_fallback', 'schema'))
-                self.src_case.set(cfg.get('source_label_match_case', False))
                 ui = cfg.get('ui', {})
             except (OSError, json.JSONDecodeError):
                 pass
 
         self.rule_tbl_limit.set(rules.get('table_level', 8))
         self.rule_vw_limit.set(rules.get('view_level', 8))
-        self.ex_case.set(rules.get('exclude_match_case', False))
-        self.blk_case.set(rules.get('block_match_case', False))
-        self.tbl_case.set(rules.get('table_match_case', False))
-        self.vw_case.set(rules.get('view_match_case', False))
         self.ex_text.insert('1.0', '\n'.join(rules.get('exclude_patterns', [])))
         self.blk_text.insert('1.0', '\n'.join(rules.get('block_patterns', [])))
         self.tbl_text.insert('1.0', '\n'.join(rules.get('table_patterns', [])))
         self.vw_text.insert('1.0', '\n'.join(rules.get('view_patterns', [])))
         self.src_text.insert('1.0', '\n'.join(f'{k} = {v}' for k, v in labels.items()))
+        self.drop_summary.set(rules.get('drop_no_lineage_summary', True))
+        self.drop_detailed.set(rules.get('drop_no_lineage_detailed', True))
         self.apply_summary.set(rules.get('apply_to_summary', True))
         self.apply_detailed.set(rules.get('apply_to_detailed', False))
 
@@ -603,7 +598,6 @@ class LineageApp:
         self.opt_detailed.set(ui.get('include_detailed', True))
         self.opt_separate.set(ui.get('separate_detailed', False))
         self.opt_unformatted.set(ui.get('unformatted', False))
-        self.opt_drop_no_lineage.set(ui.get('drop_no_lineage', True))
 
 
 def run():

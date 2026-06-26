@@ -41,30 +41,31 @@ log = logging.getLogger("data_lineage")
 # DATABASE.SCHEMA.OBJECT triple. '*' matches within a segment; entries with
 # fewer than three segments auto-pad with '.*' (so 'TEMP_DB' -> 'TEMP_DB.*.*'
 # and 'DB.SCHEMA' -> 'DB.SCHEMA.*'). '*.*.*' matches everything (logged).
-# Matching is case-insensitive unless the section's *_match_case flag is on
-# (Snowflake quoted identifiers are case-sensitive). A JSON file passed via
-# --config (or the GUI) overrides these.
+# Matching is case-INSENSITIVE by default; wrap an entry in quotes to make it
+# case-SENSITIVE, e.g.  "PROD_DATALAKE.LAWPROD.attrep_changes*"  (Snowflake
+# quoted identifiers are case-sensitive). A JSON file passed via --config (or
+# the GUI) overrides these.
 # --------------------------------------------------------------------------
 TRIVIAL_RULES = {
     # Objects that must NOT appear in the output at all (hidden and not expanded).
     'exclude_patterns': [],
-    'exclude_match_case': False,
 
     # Objects shown in the output, but whose upstream is NOT expanded.
     'block_patterns': [],
-    'block_match_case': False,
 
     # Stop expanding matching TABLES once they sit beyond this level.
     'table_patterns': [],
     'table_level': 8,
-    'table_match_case': False,
 
     # Stop expanding matching VIEWS once they sit beyond this level.
     'view_patterns': [],
     'view_level': 8,
-    'view_match_case': False,
 
-    # Which sheet sets the rules apply to.
+    # Drop root queries that have no upstream lineage, per sheet set.
+    'drop_no_lineage_summary': True,
+    'drop_no_lineage_detailed': True,
+
+    # Which sheet sets the pattern rules apply to.
     'apply_to_summary': True,
     'apply_to_detailed': False,
 }
@@ -98,16 +99,15 @@ EXCEL_FORMAT = {
 # --------------------------------------------------------------------------
 # CONFIGURATION: "List of sources" labels
 # 'glob pattern' : 'label', using the same DATABASE.SCHEMA.OBJECT glob syntax
-# as the pruning rules. The FIRST matching pattern (top-to-bottom) wins, so
-# ordering sets priority. Fallback when nothing matches: 'schema', 'db' or
-# 'blank'. Matching honours SOURCE_LABEL_MATCH_CASE.
+# as the pruning rules (quote an entry for case-sensitive matching). The FIRST
+# matching pattern (top-to-bottom) wins, so ordering sets priority. Fallback
+# when nothing matches: 'schema', 'db' or 'blank'.
 # --------------------------------------------------------------------------
 SOURCE_LABELS = {
     'PROD_DATALAKE.CRM_MSCRM.*': 'CRM',
     'PROD_DATALAKE.LAWPROD.*': 'LAWSON',
     'DATALAKE.PUBLIC.*': 'LAWSON',
 }
-SOURCE_LABEL_MATCH_CASE = False
 SOURCE_LABEL_FALLBACK = 'schema'
 
 NBSP = ' '
@@ -131,29 +131,33 @@ def _clean_field(value) -> str:
     return str(value)
 
 
-def compile_patterns(patterns, case_sensitive: bool):
+def compile_patterns(patterns):
     """Compile glob patterns into [(original, [db_re, schema_re, object_re]), ...].
-    Each pattern is split on '.' into at most three segments (db, schema,
-    object), padded with '*' to three, then each segment glob-compiled. A
-    pattern that reduces to '*.*.*' (matches everything) is flagged in the log
-    but still compiled."""
-    flags = 0 if case_sensitive else re.IGNORECASE
+    Matching is case-insensitive UNLESS the whole entry is wrapped in quotes
+    ("..." or '...'), which strips the quotes and matches case-sensitively
+    (for Snowflake quoted identifiers). Each (unquoted) pattern is split on '.'
+    into at most three segments, padded with '*' to three, then each segment
+    glob-compiled. A pattern reducing to '*.*.*' is flagged in the log."""
     compiled = []
-    for pat in patterns:
-        pat = pat.strip()
-        if not pat:
+    for raw in patterns:
+        raw = raw.strip()
+        if not raw:
             continue
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in '"\'':
+            pat, flags = raw[1:-1], 0              # quoted -> case-sensitive
+        else:
+            pat, flags = raw, re.IGNORECASE
         parts = pat.split('.')
         if len(parts) < 3:
             parts = parts + ['*'] * (3 - len(parts))
         elif len(parts) > 3:                       # object name containing dots
             parts = parts[:2] + ['.'.join(parts[2:])]
         if all(p.strip() == '*' for p in parts):
-            log.warning("Rule '%s' matches every object - applying it anyway.", pat)
+            log.warning("Rule '%s' matches every object - applying it anyway.", raw)
         seg_res = [re.compile(re.escape(seg).replace(r'\*', '.*').replace(r'\?', '.') + r'\Z',
                               flags)
                    for seg in parts]
-        compiled.append((pat, seg_res))
+        compiled.append((raw, seg_res))
     return compiled
 
 
@@ -295,14 +299,10 @@ class DataLineageBuilder:
     def _compile_rules(self):
         """Compile each rule section's glob patterns once per build."""
         r = self.rules
-        self._rc_exclude = compile_patterns(r.get('exclude_patterns', []),
-                                            r.get('exclude_match_case', False))
-        self._rc_block = compile_patterns(r.get('block_patterns', []),
-                                          r.get('block_match_case', False))
-        self._rc_table = compile_patterns(r.get('table_patterns', []),
-                                          r.get('table_match_case', False))
-        self._rc_view = compile_patterns(r.get('view_patterns', []),
-                                         r.get('view_match_case', False))
+        self._rc_exclude = compile_patterns(r.get('exclude_patterns', []))
+        self._rc_block = compile_patterns(r.get('block_patterns', []))
+        self._rc_table = compile_patterns(r.get('table_patterns', []))
+        self._rc_view = compile_patterns(r.get('view_patterns', []))
 
     def _rule_action(self, name: str, level: int) -> tuple[str, str | None]:
         """Decide what happens to a node: 'exclude' (hide it entirely),
@@ -436,19 +436,17 @@ class ClientExcelRenderer:
     DATA_START_ROW = 4   # row 1 blank, row 2 group header, row 3 sub header
 
     def __init__(self, fmt: dict | None = None, source_labels: dict | None = None,
-                 source_fallback: str | None = None, source_match_case: bool | None = None):
+                 source_fallback: str | None = None):
         from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
         self.fmt = EXCEL_FORMAT if fmt is None else fmt
         labels = SOURCE_LABELS if source_labels is None else source_labels
         self.source_fallback = (SOURCE_LABEL_FALLBACK if source_fallback is None
                                 else source_fallback)
-        match_case = (SOURCE_LABEL_MATCH_CASE if source_match_case is None
-                      else source_match_case)
         # Compile labels to (label, seg_res) preserving order (first match wins).
         self._source_labels = []
         for pat, label in labels.items():
-            comp = compile_patterns([pat], match_case)
+            comp = compile_patterns([pat])
             if comp:
                 self._source_labels.append((label, comp[0][1]))
         f = self.fmt
@@ -717,16 +715,18 @@ class ClientExcelRenderer:
 def build_workbooks(input_files: list[str], output_path: str | None = None,
                     rules: dict | None = None, fmt: dict | None = None,
                     source_labels: dict | None = None, source_fallback: str | None = None,
-                    source_match_case: bool | None = None,
                     include_detailed: bool = True, separate_detailed: bool = False,
-                    unformatted: bool = False, drop_no_lineage: bool = True,
-                    progress=None) -> list[str]:
+                    unformatted: bool = False, progress=None) -> list[str]:
     """Process every input file and write the output workbook(s).
     Returns the list of files written. `progress` is an optional callback(str).
 
-    drop_no_lineage: skip root queries that have no upstream lineage at all
-    (e.g. tables hardcoded inside PowerBI) — they otherwise add a noise row."""
+    Whether root queries with no upstream lineage are dropped is read per sheet
+    set from rules['drop_no_lineage_summary'/'_detailed']."""
     import openpyxl
+
+    eff_rules = TRIVIAL_RULES if rules is None else rules
+    drop_summary = eff_rules.get('drop_no_lineage_summary', True)
+    drop_detailed = eff_rules.get('drop_no_lineage_detailed', True)
 
     def report_progress(msg):
         log.info(msg)
@@ -746,8 +746,8 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         builder = DataLineageBuilder(path, rules=rules).load()
         report_progress(f"Tracing lineage: {builder.report_name}")
         summary_roots, expanded_at = builder.build_tree(
-            summarize=True, drop_no_lineage=drop_no_lineage)
-        detailed = (builder.build_tree(summarize=False, drop_no_lineage=drop_no_lineage)
+            summarize=True, drop_no_lineage=drop_summary)
+        detailed = (builder.build_tree(summarize=False, drop_no_lineage=drop_detailed)
                     if include_detailed else (None, None))
         reports.append({'builder': builder, 'summary': (summary_roots, expanded_at),
                         'detailed': detailed})
@@ -755,7 +755,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     if unformatted:
         return [_export_unformatted(reports, output_path)]
 
-    renderer = ClientExcelRenderer(fmt, source_labels, source_fallback, source_match_case)
+    renderer = ClientExcelRenderer(fmt, source_labels, source_fallback)
     written = []
 
     wb = openpyxl.Workbook()
@@ -939,9 +939,8 @@ def load_config(path: str):
     if 'source_labels' in cfg:
         SOURCE_LABELS.clear()
         SOURCE_LABELS.update(cfg['source_labels'])
-    global SOURCE_LABEL_FALLBACK, SOURCE_LABEL_MATCH_CASE
+    global SOURCE_LABEL_FALLBACK
     SOURCE_LABEL_FALLBACK = cfg.get('source_label_fallback', SOURCE_LABEL_FALLBACK)
-    SOURCE_LABEL_MATCH_CASE = cfg.get('source_label_match_case', SOURCE_LABEL_MATCH_CASE)
     log.info("Loaded config overrides from %s", path)
 
 
@@ -987,12 +986,14 @@ def main(argv=None):
             sys.exit(1)
         inputs = [raw]
 
+    cli_rules = dict(TRIVIAL_RULES)
+    cli_rules['drop_no_lineage_summary'] = args.drop_no_lineage
+    cli_rules['drop_no_lineage_detailed'] = args.drop_no_lineage
     try:
-        written = build_workbooks(inputs, args.output,
+        written = build_workbooks(inputs, args.output, rules=cli_rules,
                                   include_detailed=not args.no_detailed,
                                   separate_detailed=args.separate,
-                                  unformatted=args.unformatted,
-                                  drop_no_lineage=args.drop_no_lineage)
+                                  unformatted=args.unformatted)
     except Exception as exc:
         log.error("Failed to process lineage: %s", exc)
         sys.exit(1)

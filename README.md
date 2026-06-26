@@ -91,19 +91,23 @@ same schema):
   segment and entries with fewer than three segments auto-pad with `.*`
   (`TEMP_DB` → `TEMP_DB.*.*`, `DB.SCHEMA` → `DB.SCHEMA.*`), so `*.DATAWAREHOUSE.*`,
   `PROD_*.*.BRANCH*` all work; `*.*.*` matches everything (logged). Matching is
-  case-insensitive unless the section's `*_match_case` flag is set (Snowflake
-  quoted identifiers are case-sensitive). The four sections are:
-  `exclude_patterns` (hidden from output, not expanded), `block_patterns`
-  (shown but not expanded), and `table_patterns` / `view_patterns` (shown but
-  not expanded once *beyond* `table_level` / `view_level`). `apply_to_summary`
-  and `apply_to_detailed` choose which sheet set the rules touch.
+  **case-insensitive** unless you **wrap the entry in quotes**
+  (`"PROD_DATALAKE.LAWPROD.attrep_changes*"`), which matches case-sensitively —
+  for Snowflake quoted identifiers. The four sections are: `exclude_patterns`
+  (hidden from output, not expanded), `block_patterns` (shown but not
+  expanded), and `table_patterns` / `view_patterns` (shown but not expanded
+  once *beyond* `table_level` / `view_level`). `drop_no_lineage_summary` /
+  `drop_no_lineage_detailed` drop root queries with no upstream, and
+  `apply_to_summary` / `apply_to_detailed` choose which sheet set the pattern
+  rules touch — each independently per sheet set.
 * **`EXCEL_FORMAT`** — colors, font, borders, padding, query-block merging,
   hyperlinks, optional freeze panes.
 * **`SOURCE_LABELS`** — `glob pattern` → label map for the "List of sources"
   column, using the same glob syntax as the rules (e.g.
-  `*.CRM_MSCRM.*` → `CRM`); the **first matching pattern wins**, so ordering
-  sets priority. `SOURCE_LABEL_FALLBACK` picks what to show when nothing matches
-  (`schema`, `db` or `blank`); `SOURCE_LABEL_MATCH_CASE` toggles case-sensitivity.
+  `*.CRM_MSCRM.*` → `CRM`; quote an entry for case-sensitive matching); the
+  **first matching pattern wins**, so ordering sets priority.
+  `SOURCE_LABEL_FALLBACK` picks what to show when nothing matches
+  (`schema`, `db` or `blank`).
 * **Watermark** — a small muted mark in the GUI's top-right corner, **off by
   default**. Turn it on (without forking the code) via any of, in priority
   order: the `LINEAGE_WATERMARK` environment variable, a `watermark.txt`
