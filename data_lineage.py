@@ -493,20 +493,36 @@ class ClientExcelRenderer:
                             'Name': '.'.join(p[2:]), 'Type': 'View'}
                 return {'Database': '', 'Schema': '', 'Name': name, 'Type': ''}
 
+        # The seed must exercise the FULL Query-column merge geometry, or the
+        # per-report files and the aux end up with different style tables and
+        # the XML splice mis-maps indices. openpyxl's MergedCellRange.format()
+        # (run at save) strips a vertical merge's interior cells down to a
+        # left+right-only border -- but only when the block is >=3 rows tall,
+        # so the "covered cell" style is born only from a tall block. A 2-row
+        # seed (the old one) never created it, so it drifted to a divergent
+        # cellXfs slot and covered Query cells rendered bold + no side border.
+        # Root 1: a tall (>=3 row) merged block -> top / interior / bottom
+        # border variants. Root 2: a 1-row block -> the unmerged anchor style
+        # (bold + centered + full border), for single-row queries / merge off.
         root = Node('Q', 0); root.status = ST_EXPANDED
         view = Node('DB.SCH.VIEW', 1); view.status = ST_EXPANDED
         tbl = Node('DB.SCH.TBL', 2); tbl.status = ST_SOURCE
-        view.children = [tbl]
-        dup = Node('DB.SCH.VIEW', 1); dup.status = ST_DUP   # forces a font_link hyperlink
-        root.children = [view, dup]
+        view.children = [tbl]                                # block row 1
+        extra = Node('DB.SCH.EXTRA', 1); extra.status = ST_SOURCE  # row 2 (interior)
+        dup = Node('DB.SCH.VIEW', 1); dup.status = ST_DUP    # row 3; forces font_link
+        root.children = [view, extra, dup]                   # 3 rows -> tall merge
+        solo = Node('Q2', 0); solo.status = ST_EXPANDED
+        solo_src = Node('DB.SCH.SOLO', 1); solo_src.status = ST_SOURCE
+        solo.children = [solo_src]                           # 1 row -> unmerged
         self.render_lineage_sheet(wb, self.SEED_SHEET, _StubBuilder(),
-                                  [root], {'DB.SCH.VIEW': view}, link_dups=True)
+                                  [root, solo], {'DB.SCH.VIEW': view}, link_dups=True)
         grid = wb.create_sheet(self.SEED_GRID)
         self._write_grid(grid, ['a', 'b'], [['x', 'y']], [10, 10])
-        label = grid.cell(row=10, column=2, value='r')        # rootless label combo
+        # The Source Tables "rootless" section label is bold with NO border
+        # (see _write_source_sheet); seed that exact combination -- with a
+        # border it seeds the wrong style and the aux's styles.xml diverges.
+        label = grid.cell(row=10, column=2, value='r')
         label.font = self.font_data_bold
-        if self.border:
-            label.border = self.border
         for name in (self.SEED_SHEET, self.SEED_GRID):
             wb[name].sheet_state = 'hidden'
 
@@ -883,6 +899,13 @@ _NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 _WS_CT = 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'
 
 
+class _StyleMergeMismatch(Exception):
+    """A per-report file's styles.xml diverged from the aux template, so its
+    verbatim `s=` style indices can't be safely spliced. Signals build_workbooks
+    to fall back to the (correct, slower) serial combine instead of emitting a
+    workbook with mis-mapped cell styles."""
+
+
 def _sheet_xml_by_name(zf: zipfile.ZipFile, name: str) -> bytes:
     """Return the worksheet XML for sheet `name` from an .xlsx zip, resolved via
     workbook.xml -> rels (robust to sheet ordering / hidden seed sheets)."""
@@ -1043,9 +1066,15 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
         aux_path = _build_aux(results, fmt, source_labels, source_fallback, include_detailed)
         ordered = []
         with zipfile.ZipFile(aux_path) as az:
+            aux_styles = az.read('xl/styles.xml')
             ordered.append(('List of Reports', _sheet_xml_by_name(az, 'List of Reports')))
             for res in results:
                 with zipfile.ZipFile(res['out_path']) as rz:
+                    # The splice keeps each sheet's `s=` indices verbatim, so
+                    # every file MUST share the aux's styles.xml (seed_styles
+                    # guarantees this). Refuse to emit a mis-styled workbook.
+                    if rz.read('xl/styles.xml') != aux_styles:
+                        raise _StyleMergeMismatch(res['report_name'])
                     ordered.append((res['summary_sheet'],
                                     _sheet_xml_by_name(rz, res['summary_sheet'])))
                     if include_detailed and res['detailed_sheet']:
@@ -1107,9 +1136,14 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     #  fallback, where no cross-file splice is needed)
     if (combine and not unformatted and not separate_detailed
             and _resolve_workers(max_workers, len(input_files)) > 1):
-        return _build_combined_merged(input_files, output_path, eff_rules, fmt,
-                                      source_labels, source_fallback, include_detailed,
-                                      max_workers, report_progress)
+        try:
+            return _build_combined_merged(input_files, output_path, eff_rules, fmt,
+                                          source_labels, source_fallback, include_detailed,
+                                          max_workers, report_progress)
+        except _StyleMergeMismatch as exc:
+            report_progress(f"  Style tables diverged for '{exc}' - falling back to a "
+                            f"serial combine to keep formatting correct.")
+            # fall through to the serial combined path below
 
     # ---- build all lineage trees (serial: combined / unformatted) ----
     reports = []
