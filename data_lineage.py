@@ -28,8 +28,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
+import zipfile
 from collections import deque
+from xml.sax.saxutils import escape as _xml_escape, unescape as _xml_unescape
 
 import pandas as pd
 
@@ -468,6 +472,44 @@ class ClientExcelRenderer:
         self.align_center = Alignment(horizontal='center', vertical='center',
                                       wrap_text=True)
 
+    SEED_SHEET = '__seed__'        # hidden style-seed lineage sheet
+    SEED_GRID = '__seed_grid__'    # hidden style-seed index/source grid
+
+    def seed_styles(self, wb):
+        """Render a tiny example through the REAL renderer onto hidden sheets so
+        the workbook's style table is complete and byte-identical across every
+        report and the index/source aux. openpyxl prunes styles that no live
+        cell references, and font_link / fill_index are used only conditionally,
+        so without this a no-dups report or the aux would get a different
+        styles.xml and the raw XML-splice merge would mis-map style indices.
+        Driving it through render_lineage_sheet + _write_grid (rather than a
+        hand-listed palette) keeps it automatically in sync with the renderer.
+        The seed sheets are hidden and never copied into the merged output."""
+        class _StubBuilder:
+            def object_meta(self, name):
+                p = name.split('.')
+                if len(p) >= 3:
+                    return {'Database': p[0], 'Schema': p[1],
+                            'Name': '.'.join(p[2:]), 'Type': 'View'}
+                return {'Database': '', 'Schema': '', 'Name': name, 'Type': ''}
+
+        root = Node('Q', 0); root.status = ST_EXPANDED
+        view = Node('DB.SCH.VIEW', 1); view.status = ST_EXPANDED
+        tbl = Node('DB.SCH.TBL', 2); tbl.status = ST_SOURCE
+        view.children = [tbl]
+        dup = Node('DB.SCH.VIEW', 1); dup.status = ST_DUP   # forces a font_link hyperlink
+        root.children = [view, dup]
+        self.render_lineage_sheet(wb, self.SEED_SHEET, _StubBuilder(),
+                                  [root], {'DB.SCH.VIEW': view}, link_dups=True)
+        grid = wb.create_sheet(self.SEED_GRID)
+        self._write_grid(grid, ['a', 'b'], [['x', 'y']], [10, 10])
+        label = grid.cell(row=10, column=2, value='r')        # rootless label combo
+        label.font = self.font_data_bold
+        if self.border:
+            label.border = self.border
+        for name in (self.SEED_SHEET, self.SEED_GRID):
+            wb[name].sheet_state = 'hidden'
+
     # -- helpers -------------------------------------------------------------
     def source_label(self, name: str, meta: dict) -> str:
         fields = (_clean_field(meta.get('Database')),
@@ -744,6 +786,8 @@ def _render_report_task(task: dict) -> dict:
     renderer = ClientExcelRenderer(task['fmt'], task['source_labels'], task['source_fallback'])
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
+    if task.get('seed'):                       # for merge: identical styles.xml across files
+        renderer.seed_styles(wb)
     s_info = renderer.render_lineage_sheet(wb, task['summary_sheet'], builder,
                                            s_roots, s_exp, link_dups=True)
     d_info = None
@@ -788,7 +832,7 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress) -> list[
 
 
 def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
-                       include_detailed, include_source, out_paths) -> list[dict]:
+                       include_detailed, include_source, out_paths, seed=False) -> list[dict]:
     """Build per-report task dicts with globally-unique sheet names so the
     rendered sheets never collide when merged and internal hyperlinks stay valid."""
     drop_s = eff_rules.get('drop_no_lineage_summary', True)
@@ -803,7 +847,7 @@ def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallba
         tasks.append({'path': path, 'rules': eff_rules, 'fmt': fmt,
                       'source_labels': source_labels, 'source_fallback': source_fallback,
                       'include_detailed': include_detailed, 'include_source': include_source,
-                      'drop_summary': drop_s, 'drop_detailed': drop_d,
+                      'seed': seed, 'drop_summary': drop_s, 'drop_detailed': drop_d,
                       'summary_sheet': s_sheet, 'detailed_sheet': d_sheet, 'out_path': out_path})
     return tasks
 
@@ -830,6 +874,191 @@ def _build_separate_files(input_files, output_path, eff_rules, fmt, source_label
                     f"with {workers} worker process(es)...")
     results = _run_report_tasks(tasks, workers, report_progress)
     return [r['out_path'] for r in results if r]
+
+
+# ===========================================================================
+# XML-LEVEL MERGE (cheap: splice pre-rendered worksheets into one workbook)
+# ===========================================================================
+_NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+_WS_CT = 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'
+
+
+def _sheet_xml_by_name(zf: zipfile.ZipFile, name: str) -> bytes:
+    """Return the worksheet XML for sheet `name` from an .xlsx zip, resolved via
+    workbook.xml -> rels (robust to sheet ordering / hidden seed sheets)."""
+    wbxml = zf.read('xl/workbook.xml').decode('utf-8')
+    rels = zf.read('xl/_rels/workbook.xml.rels').decode('utf-8')
+    rid = None
+    for tag in re.findall(r'<sheet\b[^>]*?/?>', wbxml):
+        nm = re.search(r'\bname="([^"]*)"', tag)
+        ri = re.search(r'\br:id="([^"]*)"', tag)
+        if nm and ri and _xml_unescape(nm.group(1)) == name:
+            rid = ri.group(1)
+            break
+    if rid is None:
+        raise KeyError(f"sheet {name!r} not found")
+    target = None
+    for tag in re.findall(r'<Relationship\b[^>]*?/?>', rels):
+        if re.search(r'\bId="' + re.escape(rid) + r'"', tag):
+            target = re.search(r'\bTarget="([^"]*)"', tag).group(1)
+            break
+    target = target.lstrip('/')
+    if not target.startswith('xl/'):
+        target = 'xl/' + target
+    return zf.read(target)
+
+
+def _safe_replace(tmp_path: str, target: str) -> str:
+    """Move tmp_path onto target; if target is locked (open in Excel), fall back
+    to a numbered name."""
+    try:
+        os.replace(tmp_path, target)
+        return target
+    except PermissionError:
+        base, ext = os.path.splitext(target)
+        for n in range(1, 100):
+            alt = f'{base} ({n}){ext}'
+            try:
+                os.replace(tmp_path, alt)
+                log.warning("'%s' is open elsewhere - saved as '%s' instead.",
+                            os.path.basename(target), os.path.basename(alt))
+                return alt
+            except PermissionError:
+                continue
+        raise
+
+
+def _build_aux(results, fmt, source_labels, source_fallback, include_detailed) -> str:
+    """Build a (seeded) workbook holding just the combined index + merged Source
+    Tables, save it to a temp file, and return the path. Its styles.xml matches
+    the per-report files (seed_styles), so its sheet XML can be spliced in."""
+    import openpyxl
+    renderer = ClientExcelRenderer(fmt, source_labels, source_fallback)
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    renderer.seed_styles(wb)
+
+    index_ws = wb.create_sheet('List of Reports')
+    index_rows = [[r['report_name'], r['queries'], r['source_count'], f"L{r['max_depth']}",
+                   r['summary_rows'], r['detailed_rows'], r['input_basename']] for r in results]
+    renderer._write_grid(index_ws,
+                         ['Report', 'Queries', 'Source tables', 'Max depth',
+                          'Summary rows', 'Detailed rows', 'Input file'],
+                         index_rows, [45, 10, 13, 10, 13, 13, 45])
+    from openpyxl.worksheet.hyperlink import Hyperlink
+    for i, res in enumerate(results):
+        cell = index_ws.cell(row=3 + i, column=2)
+        cell.hyperlink = Hyperlink(ref=cell.coordinate,
+                                   location="'%s'!B2" % res['summary_sheet'])
+        cell.font = renderer.font_link
+
+    sources, rootless = _aggregate_source_rows(results, renderer)
+    _write_source_sheet(wb, renderer, sources, rootless)
+
+    fd, aux_path = tempfile.mkstemp(suffix='.xlsx')
+    os.close(fd)
+    wb.save(aux_path)
+    return aux_path
+
+
+def _merge_xlsx(ordered_sheets: list[tuple], template_path: str, output_path: str) -> str:
+    """Assemble one workbook from pre-rendered worksheet XML by raw zip writing
+    (no openpyxl re-render). Every source must share template_path's styles.xml
+    (guaranteed by seed_styles). ordered_sheets is [(sheet_name, sheet_xml_bytes)]."""
+    n = len(ordered_sheets)
+    with zipfile.ZipFile(template_path) as tz:
+        styles = tz.read('xl/styles.xml')
+        theme = tz.read('xl/theme/theme1.xml')
+        dotrels = tz.read('_rels/.rels')
+        core = tz.read('docProps/core.xml')
+
+    sheets = ''.join(f'<sheet name="{_xml_escape(name)}" sheetId="{i}" r:id="rId{i}"/>'
+                     for i, (name, _) in enumerate(ordered_sheets, 1))
+    workbook = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                f'xmlns:r="{_NS_R}"><sheets>{sheets}</sheets></workbook>')
+
+    rels = [f'<Relationship Id="rId{i}" Type="{_NS_R}/worksheet" '
+            f'Target="worksheets/sheet{i}.xml"/>' for i in range(1, n + 1)]
+    rels.append(f'<Relationship Id="rId{n + 1}" Type="{_NS_R}/styles" Target="styles.xml"/>')
+    rels.append(f'<Relationship Id="rId{n + 2}" Type="{_NS_R}/theme" Target="theme/theme1.xml"/>')
+    wbrels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+              + ''.join(rels) + '</Relationships>')
+
+    ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+          '<Default Extension="xml" ContentType="application/xml"/>',
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+          '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+          '<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>',
+          '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>',
+          '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>']
+    ct += [f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="{_WS_CT}"/>'
+           for i in range(1, n + 1)]
+    ct.append('</Types>')
+    content_types = ''.join(ct)
+
+    titles = ''.join(f'<vt:lpstr>{_xml_escape(name)}</vt:lpstr>' for name, _ in ordered_sheets)
+    app = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+           '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+           'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+           '<Application>Microsoft Excel</Application>'
+           f'<TitlesOfParts><vt:vector size="{n}" baseType="lpstr">{titles}</vt:vector></TitlesOfParts>'
+           '</Properties>')
+
+    tmp_out = output_path + '.tmp'
+    with zipfile.ZipFile(tmp_out, 'w', zipfile.ZIP_DEFLATED) as out:
+        out.writestr('[Content_Types].xml', content_types)
+        out.writestr('_rels/.rels', dotrels)
+        out.writestr('docProps/app.xml', app)
+        out.writestr('docProps/core.xml', core)
+        out.writestr('xl/workbook.xml', workbook)
+        out.writestr('xl/_rels/workbook.xml.rels', wbrels)
+        out.writestr('xl/styles.xml', styles)
+        out.writestr('xl/theme/theme1.xml', theme)
+        for i, (_, xml) in enumerate(ordered_sheets, 1):
+            out.writestr(f'xl/worksheets/sheet{i}.xml', xml)
+    return _safe_replace(tmp_out, output_path)
+
+
+def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labels,
+                           source_fallback, include_detailed, max_workers, report_progress):
+    """Render every report to a standalone file in parallel, then splice their
+    Summary/Detailed sheets + a combined index + merged Source Tables into one
+    workbook by raw XML assembly."""
+    tmpdir = tempfile.mkdtemp(prefix='lineage_merge_')
+    aux_path = None
+    try:
+        out_paths = [os.path.join(tmpdir, f'r{i}.xlsx') for i in range(len(input_files))]
+        tasks = _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
+                                   include_detailed, include_source=False, out_paths=out_paths,
+                                   seed=True)
+        workers = _resolve_workers(max_workers, len(tasks))
+        report_progress(f"Rendering {len(tasks)} report(s) with {workers} worker process(es)...")
+        results = _run_report_tasks(tasks, workers, report_progress)
+
+        report_progress("Merging into one workbook...")
+        aux_path = _build_aux(results, fmt, source_labels, source_fallback, include_detailed)
+        ordered = []
+        with zipfile.ZipFile(aux_path) as az:
+            ordered.append(('List of Reports', _sheet_xml_by_name(az, 'List of Reports')))
+            for res in results:
+                with zipfile.ZipFile(res['out_path']) as rz:
+                    ordered.append((res['summary_sheet'],
+                                    _sheet_xml_by_name(rz, res['summary_sheet'])))
+                    if include_detailed and res['detailed_sheet']:
+                        ordered.append((res['detailed_sheet'],
+                                        _sheet_xml_by_name(rz, res['detailed_sheet'])))
+            ordered.append(('Source Tables', _sheet_xml_by_name(az, 'Source Tables')))
+        final = _merge_xlsx(ordered, aux_path, output_path)
+        report_progress(f"Saved {final}")
+        return [final]
+    finally:
+        if aux_path and os.path.exists(aux_path):
+            os.remove(aux_path)
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ===========================================================================
@@ -872,6 +1101,15 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         for path in written:
             report_progress(f"Saved {path}")
         return written
+
+    # ---- combined workbook, parallel render + cheap XML merge ----
+    # (the serial path below still handles separate_detailed and the 1-worker
+    #  fallback, where no cross-file splice is needed)
+    if (combine and not unformatted and not separate_detailed
+            and _resolve_workers(max_workers, len(input_files)) > 1):
+        return _build_combined_merged(input_files, output_path, eff_rules, fmt,
+                                      source_labels, source_fallback, include_detailed,
+                                      max_workers, report_progress)
 
     # ---- build all lineage trees (serial: combined / unformatted) ----
     reports = []
@@ -950,46 +1188,86 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     return written
 
 
-def _add_source_rollup(wb, renderer: ClientExcelRenderer, reports: list[dict]):
-    """Source-table rollup across all reports. The real source tables (the
-    migration worklist) come first; root queries that have no lineage of their
-    own are kept but separated into a labelled section below."""
-    def collect(getter, exclude=frozenset()) -> tuple[list[list], set]:
-        usage: dict[str, dict] = {}
-        for rep in reports:
-            builder = rep['builder']
-            for name in getter(builder):
-                if name in exclude:
-                    continue
-                entry = usage.setdefault(name, {'meta': builder.object_meta(name), 'reports': []})
-                entry['reports'].append(builder.report_name)
-        rows = []
-        for name in sorted(usage):
-            meta, reps = usage[name]['meta'], usage[name]['reports']
-            rows.append([meta['Database'], meta['Schema'], meta['Name'], meta['Type'],
-                         renderer.source_label(name, meta), len(reps),
-                         ', '.join(sorted(set(reps)))])
-        return rows, set(usage)
+_SOURCE_HEADER = ['db', 'schema', 'object', 'type', 'List of sources',
+                  'Used by # reports', 'Reports']
+_SOURCE_WIDTHS = [24, 18, 40, 8, 19, 16, 60]
 
-    sources, source_names = collect(lambda b: b.source_tables())
-    # A name that is a real source in any report belongs in the worklist above,
-    # never the rootless section — even if another report has it as a root.
-    rootless, _ = collect(lambda b: b.rootless_queries(), exclude=source_names)
-    header = ['db', 'schema', 'object', 'type', 'List of sources',
-              'Used by # reports', 'Reports']
-    widths = [24, 18, 40, 8, 19, 16, 60]
 
+def _write_source_sheet(wb, renderer: ClientExcelRenderer, sources: list[list],
+                        rootless: list[list]):
+    """Write the 'Source Tables' sheet: real source tables (migration worklist)
+    on top; no-lineage root queries in a labelled section below."""
     ws = wb.create_sheet('Source Tables')
     # Skip the real-sources header entirely if there are none (e.g. an
     # all-rootless report), so the rootless section isn't preceded by an
     # empty orphan header.
-    last = renderer._write_grid(ws, header, sources, widths) if sources else 1
+    last = renderer._write_grid(ws, _SOURCE_HEADER, sources, _SOURCE_WIDTHS) if sources else 1
     if rootless:
         title_row = last + 2  # one blank spacer row, then a section label
         label = ws.cell(row=title_row, column=2,
                         value='Queries with no upstream lineage (not migrated)')
         label.font = renderer.font_data_bold
-        renderer._write_grid(ws, header, rootless, widths, start_row=title_row + 1)
+        renderer._write_grid(ws, _SOURCE_HEADER, rootless, _SOURCE_WIDTHS,
+                             start_row=title_row + 1)
+
+
+def _rollup_rows(usage: dict, renderer, exclude=frozenset()) -> list[list]:
+    rows = []
+    for name in sorted(usage):
+        if name in exclude:
+            continue
+        meta, reps = usage[name]['meta'], usage[name]['reports']
+        rows.append([meta['Database'], meta['Schema'], meta['Name'], meta['Type'],
+                     renderer.source_label(name, meta), len(reps),
+                     ', '.join(sorted(set(reps)))])
+    return rows
+
+
+def _add_source_rollup(wb, renderer: ClientExcelRenderer, reports: list[dict]):
+    """Source-table rollup across all reports (serial path; aggregates from
+    the in-memory builders)."""
+    def collect(getter):
+        usage: dict[str, dict] = {}
+        for rep in reports:
+            builder = rep['builder']
+            for name in getter(builder):
+                entry = usage.setdefault(name, {'meta': builder.object_meta(name), 'reports': []})
+                entry['reports'].append(builder.report_name)
+        return usage
+    src = collect(lambda b: b.source_tables())
+    root = collect(lambda b: b.rootless_queries())
+    sources = _rollup_rows(src, renderer)
+    rootless = _rollup_rows(root, renderer, exclude=set(src))
+    _write_source_sheet(wb, renderer, sources, rootless)
+
+
+def _aggregate_source_rows(results: list[dict], renderer) -> tuple[list[list], list[list]]:
+    """Source-table rollup for the parallel/merge path: aggregate the picklable
+    source rows the child processes returned (each row is
+    [db, schema, object, type, label, consolidated-name])."""
+    def collect(key):
+        usage: dict[str, dict] = {}
+        for res in results:
+            for row in res[key]:
+                name = row[5]
+                meta = {'Database': row[0], 'Schema': row[1], 'Name': row[2],
+                        'Type': row[3], '_label': row[4]}
+                entry = usage.setdefault(name, {'meta': meta, 'reports': []})
+                entry['reports'].append(res['report_name'])
+        return usage
+
+    def rows(usage, exclude=frozenset()):
+        out = []
+        for name in sorted(usage):
+            if name in exclude:
+                continue
+            m, reps = usage[name]['meta'], usage[name]['reports']
+            out.append([m['Database'], m['Schema'], m['Name'], m['Type'], m['_label'],
+                        len(set(reps)), ', '.join(sorted(set(reps)))])
+        return out
+    src = collect('source_rows')
+    root = collect('rootless_rows')
+    return rows(src), rows(root, exclude=set(src))
 
 
 def _export_unformatted(reports: list[dict], output_path: str) -> str:
