@@ -65,7 +65,7 @@ class QueueLogHandler(logging.Handler):
         self.log_queue = log_queue
 
     def emit(self, record):
-        self.log_queue.put(self.format(record))
+        self.log_queue.put(('LOG', record.levelno, self.format(record)))
 
 
 class LineageApp:
@@ -154,6 +154,7 @@ class LineageApp:
                              highlightbackground='SystemButtonFace')
             if self._watermark_lbl:
                 self._watermark_lbl.configure(background='SystemButtonFace', foreground='#C2C2C2')
+            self._apply_log_tags()
             return
 
         BG, FG, FIELD, SUB, SEL = '#2b2b2b', '#e6e6e6', '#3c3f41', '#9aa0a6', '#365880'
@@ -163,7 +164,18 @@ class LineageApp:
                         troughcolor=FIELD, arrowcolor=FG, insertcolor=FG)
         for cls in ('TFrame', 'TLabel', 'TLabelframe', 'TLabelframe.Label', 'TCheckbutton'):
             style.configure(cls, background=BG, foreground=FG)
-        style.map('TCheckbutton', background=[('active', BG)])
+        # clam's default checkbox mark reads as an ambiguous "X" on a dark
+        # palette; fill the box with a green accent + light check when selected
+        # so it reads unmistakably as a tick.
+        style.configure('TCheckbutton', indicatorbackground=FIELD,
+                        indicatorforeground=FG, indicatorcolor=FIELD,
+                        focuscolor=BG)
+        style.map('TCheckbutton',
+                  background=[('active', BG)],
+                  indicatorbackground=[('selected', '#3a8a3a'), ('pressed', '#3a8a3a'),
+                                       ('active', '#46494b')],
+                  indicatorcolor=[('selected', '#3a8a3a')],
+                  indicatorforeground=[('selected', '#ffffff')])
         style.configure('TButton', background='#3c3f41', foreground=FG)
         style.map('TButton', background=[('active', '#4a4d4f'), ('pressed', '#4a4d4f')])
         style.configure('TEntry', fieldbackground=FIELD, foreground=FG)
@@ -189,6 +201,21 @@ class LineageApp:
                          highlightbackground=BG)
         if self._watermark_lbl:
             self._watermark_lbl.configure(background=BG, foreground='#5e5e5e')
+        self._apply_log_tags()
+
+    def _apply_log_tags(self):
+        """Colour the log tags (errors / warnings / completions) for the active
+        theme so they stand out. Safe to call before the log widget exists."""
+        if not hasattr(self, 'log_text'):
+            return
+        if self.dark.get():
+            cols = {'err': '#ff7b72', 'warn': '#e3b341', 'ok': '#7ee787', 'info': '#e6e6e6'}
+        else:
+            cols = {'err': '#c0392b', 'warn': '#b9770e', 'ok': '#1e7e34', 'info': '#222222'}
+        for tag, col in cols.items():
+            bold = tag in ('err', 'warn')
+            self.log_text.tag_configure(tag, foreground=col, spacing1=1,
+                                        font=('Consolas', 9, 'bold') if bold else ('Consolas', 9))
 
     def _build_layout(self):
         header = ttk.Frame(self.root, padding=(16, 12, 16, 4))
@@ -296,24 +323,33 @@ class LineageApp:
                             "next to the first input file.",
                   style='Sub.TLabel').pack(anchor='w')
 
-        opts = ttk.LabelFrame(tab, text="Output", padding=8)
-        opts.pack(fill='x', pady=(10, 0))
         self.opt_detailed = tk.BooleanVar(value=True)
         self.opt_combine = tk.BooleanVar(value=True)
         self.opt_separate = tk.BooleanVar(value=False)
         self.worker_count = tk.IntVar(value=max(1, (os.cpu_count() or 2) - 1))
-        ttk.Checkbutton(opts, text="Include Detailed sheets", variable=self.opt_detailed
-                        ).grid(row=0, column=0, sticky='w', padx=6, pady=2)
-        ttk.Checkbutton(opts, text="Combine into one workbook", variable=self.opt_combine
-                        ).grid(row=0, column=1, sticky='w', padx=6, pady=2)
-        self.sep_cb = ttk.Checkbutton(opts, text="Detailed sheets in a separate file",
+
+        opts = ttk.Frame(tab)
+        opts.pack(fill='x', pady=(10, 0))
+        det = ttk.LabelFrame(opts, text="Detailed sheets", padding=8)
+        det.pack(side='left', fill='both', expand=True)
+        ttk.Checkbutton(det, text="Include Detailed sheets", variable=self.opt_detailed
+                        ).pack(anchor='w', padx=6, pady=2)
+        self.sep_cb = ttk.Checkbutton(det, text="Detailed sheets in a separate file",
                                       variable=self.opt_separate)
-        self.sep_cb.grid(row=1, column=0, sticky='w', padx=6, pady=2)
-        wrow = ttk.Frame(opts)
-        wrow.grid(row=1, column=1, sticky='w', padx=6, pady=2)
-        ttk.Label(wrow, text="Worker processes:").pack(side='left')
+        self.sep_cb.pack(anchor='w', padx=6, pady=2)
+
+        comb = ttk.LabelFrame(opts, text="Combining", padding=8)
+        comb.pack(side='left', fill='both', expand=True, padx=(10, 0))
+        self.combine_cb = ttk.Checkbutton(comb, text="Combine into one workbook",
+                                          variable=self.opt_combine)
+        self.combine_cb.pack(anchor='w', padx=6, pady=2)
+        wrow = ttk.Frame(comb)
+        wrow.pack(anchor='w', padx=6, pady=2)
+        ttk.Label(wrow, text="Worker process cap:").pack(side='left')
         ttk.Spinbox(wrow, from_=1, to=max(1, os.cpu_count() or 8), width=4,
                     textvariable=self.worker_count).pack(side='left', padx=4)
+        ttk.Label(comb, text="Upper limit — at most one worker per report is used.",
+                  style='Sub.TLabel').pack(anchor='w', padx=6)
         self.opt_detailed.trace_add('write', self._toggle_detailed)
         self.opt_combine.trace_add('write', self._toggle_detailed)
         self._toggle_detailed()
@@ -496,6 +532,14 @@ class LineageApp:
         self.files_list.delete(0, 'end')
         for i, path in enumerate(self._files, 1):
             self.files_list.insert('end', f'{i:>2}.  {path}')
+        self._update_combine_state()
+
+    def _update_combine_state(self):
+        """Combining is only meaningful with two or more reports; grey it out
+        otherwise (the engine names a single report after its dashboard with no
+        index sheet regardless of this toggle)."""
+        if hasattr(self, 'combine_cb'):
+            self.combine_cb.configure(state='normal' if len(self._files) > 1 else 'disabled')
 
     def _add_files(self):
         paths = filedialog.askopenfilenames(
@@ -612,20 +656,26 @@ class LineageApp:
         try:
             while True:
                 item = self.log_queue.get_nowait()
-                if isinstance(item, tuple):
+                if isinstance(item, tuple) and item and item[0] == 'LOG':
+                    _, levelno, msg = item
+                    self._log_line(msg, self._tag_for(levelno, msg))
+                elif isinstance(item, tuple):
                     kind, payload = item
                     self.progress.stop()
                     self.run_btn.config(state='normal')
                     if kind == 'DONE':
                         self.status_var.set("Done — " + os.path.basename(payload[0]))
-                        self._log_line("\nFinished. Output:")
+                        self._log_line("\nFinished. Output:", 'ok')
                         for path in payload:
-                            self._log_line(f"  {path}")
-                        self.open_file_btn.config(state='normal')
+                            self._log_line(f"  {path}", 'ok')
+                        # one file -> "Open workbook" makes sense; multiple files
+                        # (separate-files mode) -> only "Open output folder".
+                        self.open_file_btn.config(
+                            state='normal' if len(payload) == 1 else 'disabled')
                         self.open_folder_btn.config(state='normal')
                     else:
                         self.status_var.set("Failed")
-                        self._log_line(f"\nERROR: {payload}")
+                        self._log_line(f"\nERROR: {payload}", 'err')
                         messagebox.showerror("Build failed", payload)
                 else:
                     self._log_line(item)
@@ -633,9 +683,20 @@ class LineageApp:
             pass
         self.root.after(120, self._poll_log_queue)
 
-    def _log_line(self, text: str):
+    @staticmethod
+    def _tag_for(levelno: int, msg: str) -> str:
+        if levelno >= logging.ERROR:
+            return 'err'
+        if levelno >= logging.WARNING:
+            return 'warn'
+        s = msg.lstrip()
+        if s.startswith(('Saved', 'Finished', 'Done')) or 'rendered ' in s:
+            return 'ok'
+        return 'info'
+
+    def _log_line(self, text: str, tag: str = 'info'):
         self.log_text.config(state='normal')
-        self.log_text.insert('end', text + '\n')
+        self.log_text.insert('end', text + '\n', tag)
         self.log_text.see('end')
         self.log_text.config(state='disabled')
 

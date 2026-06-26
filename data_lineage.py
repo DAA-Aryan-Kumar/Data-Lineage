@@ -873,16 +873,19 @@ def _build_separate_files(input_files, output_path, eff_rules, fmt, source_label
     """One standalone workbook per report (Summary + Detailed + Source Tables),
     rendered in parallel. No index sheet (it's meaningless for single files)."""
     out_dir = os.path.dirname(output_path)
-    taken = set()
-    out_paths = []
-    for path in input_files:
-        base = re.sub(r"[\\/:*?\"<>|]", ' ', derive_report_name(path)).strip() or 'report'
-        cand, n = base, 2
-        while cand.lower() in taken:
-            cand = f'{base} ({n})'
-            n += 1
-        taken.add(cand.lower())
-        out_paths.append(os.path.join(out_dir, cand + '.xlsx'))
+    if len(input_files) == 1:
+        out_paths = [output_path]   # honour the chosen path exactly for one report
+    else:
+        taken = set()
+        out_paths = []
+        for path in input_files:
+            base = re.sub(r"[\\/:*?\"<>|]", ' ', derive_report_name(path)).strip() or 'report'
+            cand, n = base, 2
+            while cand.lower() in taken:
+                cand = f'{base} ({n})'
+                n += 1
+            taken.add(cand.lower())
+            out_paths.append(os.path.join(out_dir, cand + '.xlsx'))
     tasks = _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
                                include_detailed, include_source=True, out_paths=out_paths)
     workers = _resolve_workers(max_workers, len(tasks))
@@ -1119,7 +1122,11 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         raise ValueError("No input files provided.")
     if output_path is None:
         first = os.path.abspath(input_files[0])
-        output_path = os.path.join(os.path.dirname(first), 'Data Lineage Workbook.xlsx')
+        # A single report names itself after the dashboard; only a true
+        # multi-report combine gets the generic workbook name.
+        default = (f'{derive_report_name(first)}.xlsx' if len(input_files) == 1
+                   else 'Data Lineage Workbook.xlsx')
+        output_path = os.path.join(os.path.dirname(first), default)
     output_path = os.path.abspath(output_path)
 
     # ---- one standalone file per report (parallel, no merge) ----
@@ -1165,7 +1172,8 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
 
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-    index_ws = wb.create_sheet('List of Reports')
+    multi = len(reports) > 1          # an index sheet is pointless for one report
+    index_ws = wb.create_sheet('List of Reports') if multi else None
 
     detail_wb = None
     detail_path = None
@@ -1198,18 +1206,19 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
                            s_info['rows'], d_info['rows'] if d_info else '-',
                            os.path.basename(builder.input_file_path)])
 
-    # ---- index sheet ----
-    renderer._write_grid(index_ws,
-                         ['Report', 'Queries', 'Source tables', 'Max depth',
-                          'Summary rows', 'Detailed rows', 'Input file'],
-                         index_rows,
-                         [45, 10, 13, 10, 13, 13, 45])
-    from openpyxl.worksheet.hyperlink import Hyperlink
-    for i, rep in enumerate(reports):
-        cell = index_ws.cell(row=3 + i, column=2)
-        cell.hyperlink = Hyperlink(ref=cell.coordinate,
-                                   location=f"'{rep['s_info']['sheet']}'!B2")
-        cell.font = renderer.font_link
+    # ---- index sheet (only when there's more than one report) ----
+    if multi:
+        renderer._write_grid(index_ws,
+                             ['Report', 'Queries', 'Source tables', 'Max depth',
+                              'Summary rows', 'Detailed rows', 'Input file'],
+                             index_rows,
+                             [45, 10, 13, 10, 13, 13, 45])
+        from openpyxl.worksheet.hyperlink import Hyperlink
+        for i, rep in enumerate(reports):
+            cell = index_ws.cell(row=3 + i, column=2)
+            cell.hyperlink = Hyperlink(ref=cell.coordinate,
+                                       location=f"'{rep['s_info']['sheet']}'!B2")
+            cell.font = renderer.font_link
 
     # ---- source tables rollup ----
     _add_source_rollup(wb, renderer, reports)
