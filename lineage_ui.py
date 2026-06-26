@@ -164,18 +164,11 @@ class LineageApp:
                         troughcolor=FIELD, arrowcolor=FG, insertcolor=FG)
         for cls in ('TFrame', 'TLabel', 'TLabelframe', 'TLabelframe.Label', 'TCheckbutton'):
             style.configure(cls, background=BG, foreground=FG)
-        # clam's default checkbox mark reads as an ambiguous "X" on a dark
-        # palette; fill the box with a green accent + light check when selected
-        # so it reads unmistakably as a tick.
-        style.configure('TCheckbutton', indicatorbackground=FIELD,
-                        indicatorforeground=FG, indicatorcolor=FIELD,
-                        focuscolor=BG)
-        style.map('TCheckbutton',
-                  background=[('active', BG)],
-                  indicatorbackground=[('selected', '#3a8a3a'), ('pressed', '#3a8a3a'),
-                                       ('active', '#46494b')],
-                  indicatorcolor=[('selected', '#3a8a3a')],
-                  indicatorforeground=[('selected', '#ffffff')])
+        style.map('TCheckbutton', background=[('active', BG)])
+        # clam's default checkbox mark renders as an ambiguous "X" on a dark
+        # palette, so swap in a drawn box + green tick image (dark only; light
+        # mode keeps the native vista checkbox).
+        self._install_dark_check(style, BG, FIELD)
         style.configure('TButton', background='#3c3f41', foreground=FG)
         style.map('TButton', background=[('active', '#4a4d4f'), ('pressed', '#4a4d4f')])
         style.configure('TEntry', fieldbackground=FIELD, foreground=FG)
@@ -216,6 +209,43 @@ class LineageApp:
             bold = tag in ('err', 'warn')
             self.log_text.tag_configure(tag, foreground=col, spacing1=1,
                                         font=('Consolas', 9, 'bold') if bold else ('Consolas', 9))
+
+    def _make_check_img(self, checked: bool, bg: str, field: str) -> tk.PhotoImage:
+        """A 16px checkbox indicator: a bordered box, plus a green tick if checked."""
+        n = 16
+        img = tk.PhotoImage(master=self.root, width=n, height=n)
+        img.put(bg, to=(0, 0, n, n))                  # blend into the dark background
+        img.put('#8a8a8a', to=(2, 2, n - 1, n - 1))   # box border
+        img.put(field, to=(3, 3, n - 2, n - 2))       # box interior
+        if checked:                                    # draw a thick green check stroke
+            stroke = [(3, 8), (4, 9), (5, 10), (6, 11),
+                      (7, 10), (8, 9), (9, 8), (10, 7), (11, 6), (12, 5), (13, 4)]
+            for x, y in stroke:
+                img.put('#86e086', to=(x, y, x + 2, y + 2))
+        return img
+
+    def _install_dark_check(self, style, bg: str, field: str):
+        """Replace clam's checkbox indicator (its checked mark looks like an X)
+        with a drawn box + green tick. Created once; the layout change applies
+        only to clam, so light mode keeps its native vista checkbox."""
+        if not getattr(self, '_dark_check', None):
+            self._dark_check = (self._make_check_img(False, bg, field),
+                                self._make_check_img(True, bg, field))
+            try:
+                style.element_create('Dark.Checkbutton.indicator', 'image',
+                                     self._dark_check[0],
+                                     ('selected', self._dark_check[1]),
+                                     padding=(0, 0, 6, 0), sticky='')
+            except tk.TclError:
+                pass   # already registered (theme toggled before)
+        try:
+            style.layout('TCheckbutton', [
+                ('Checkbutton.padding', {'sticky': 'nswe', 'children': [
+                    ('Dark.Checkbutton.indicator', {'side': 'left', 'sticky': ''}),
+                    ('Checkbutton.focus', {'side': 'left', 'sticky': 'w', 'children': [
+                        ('Checkbutton.label', {'sticky': 'nswe'})]})]})])
+        except tk.TclError:
+            pass
 
     def _build_layout(self):
         header = ttk.Frame(self.root, padding=(16, 12, 16, 4))
@@ -366,8 +396,12 @@ class LineageApp:
         log_frame = ttk.LabelFrame(tab, text="Log", padding=4)
         log_frame.pack(fill='both', expand=True)
         self.opt_error_log = tk.BooleanVar(value=False)
+        self.opt_stop_on_error = tk.BooleanVar(value=False)
         ttk.Checkbutton(log_frame, variable=self.opt_error_log,
                         text="Write an error report (.txt) listing any files that were skipped"
+                        ).pack(anchor='w', padx=2, pady=(0, 2))
+        ttk.Checkbutton(log_frame, variable=self.opt_stop_on_error,
+                        text="Stop the whole build if any file fails (instead of skipping it)"
                         ).pack(anchor='w', padx=2, pady=(0, 2))
         log_body = ttk.Frame(log_frame)
         log_body.pack(fill='both', expand=True)
@@ -552,9 +586,19 @@ class LineageApp:
         paths = filedialog.askopenfilenames(
             title="Select Atlan impact reports",
             filetypes=[("Excel / CSV", "*.xlsx *.csv"), ("All files", "*.*")])
+        if not paths:
+            return
+        norm = lambda p: os.path.normcase(os.path.abspath(p))
+        # de-dupe the incoming selection (preserving its order) ...
+        seen, incoming = set(), []
         for p in paths:
-            if p not in self._files:
-                self._files.append(p)
+            k = norm(p)
+            if k not in seen:
+                seen.add(k)
+                incoming.append(p)
+        # ... then drop any existing entries for re-added files and append the
+        # new selection, so the latest order wins and there are no duplicates.
+        self._files = [f for f in self._files if norm(f) not in seen] + incoming
         self._refresh_files()
 
     def _remove_files(self):
@@ -641,6 +685,7 @@ class LineageApp:
             combine=self.opt_combine.get(),
             max_workers=self.worker_count.get(),
             write_error_log=self.opt_error_log.get(),
+            stop_on_error=self.opt_stop_on_error.get(),
         )
         self.worker = threading.Thread(target=self._worker_main, args=(kwargs,), daemon=True)
         self.worker.start()
@@ -737,6 +782,7 @@ class LineageApp:
                 'combine': self.opt_combine.get(),
                 'workers': self.worker_count.get(),
                 'error_log': self.opt_error_log.get(),
+                'stop_on_error': self.opt_stop_on_error.get(),
                 'dark': self.dark.get(),
             },
         }
@@ -793,6 +839,7 @@ class LineageApp:
         self.opt_combine.set(ui.get('combine', True))
         self.worker_count.set(ui.get('workers', max(1, (os.cpu_count() or 2) - 1)))
         self.opt_error_log.set(ui.get('error_log', False))
+        self.opt_stop_on_error.set(ui.get('stop_on_error', False))
         self.dark.set(ui.get('dark', False))
 
 
