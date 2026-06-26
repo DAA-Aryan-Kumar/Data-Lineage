@@ -77,13 +77,33 @@ class LineageApp:
         self._poll_log_queue()
 
     def _set_window_icon(self):
-        """Use app.ico for the title-bar icon (matches any packaged .exe icon).
-        Resolves from a PyInstaller bundle (sys._MEIPASS) or a plain checkout."""
+        """Give the title bar and taskbar a crisp icon at any DPI. Prefer
+        iconphoto with per-size PNGs (Tk picks the best size, sharper than
+        scaling one .ico frame); fall back to app.ico. Also set an explicit
+        AppUserModelID so Windows uses our icon on the taskbar rather than
+        grouping under python/pythonw."""
+        base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
         try:
-            base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "Accordion.DataLineageBuilder")
+        except Exception:
+            pass
+        try:
+            imgs = []
+            for size in (256, 128, 64, 48, 32, 24, 16):
+                png = os.path.join(base, f'app_{size}.png')
+                if os.path.exists(png):
+                    imgs.append(tk.PhotoImage(file=png))
+            if imgs:
+                self._icon_imgs = imgs   # keep refs alive
+                self.root.iconphoto(True, *imgs)
+        except Exception:
+            pass
+        try:
             ico = os.path.join(base, 'app.ico')
             if os.path.exists(ico):
-                self.root.iconbitmap(ico)
+                self.root.iconbitmap(default=ico)
         except Exception:
             pass
 

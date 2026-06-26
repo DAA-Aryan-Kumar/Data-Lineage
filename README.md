@@ -115,8 +115,11 @@ same schema):
   `lineage_settings.json`. This is how the personal "AK" build is produced
   from the same source.
 
-The app icon is `app.ico` (vector master `app.svg`); it is used for both the
-window title bar and the packaged `.exe`.
+The app icon is `app.ico` (vector master `app.svg`), used for the packaged
+`.exe`. The GUI title bar/taskbar use per-size PNGs (`app_16.png` … `app_256.png`)
+via `iconphoto` for crisp rendering at any DPI, plus an explicit Windows
+AppUserModelID. Bundle the PNGs into the `.exe` with `--add-data` (see the
+build command) so the frozen GUI finds them.
 
 ## Requirements
 
