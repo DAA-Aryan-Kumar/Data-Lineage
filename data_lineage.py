@@ -834,6 +834,11 @@ class ClientExcelRenderer:
 # ===========================================================================
 # PARALLEL RENDERING (one process per report)
 # ===========================================================================
+class BuildCancelled(Exception):
+    """Raised when a caller's cancel signal (a threading.Event) is set mid-build,
+    so the run unwinds cleanly (temp dirs removed, pool workers terminated)."""
+
+
 def _resolve_workers(max_workers, n_tasks: int) -> int:
     """Resolve the worker count, clamped to [1, n_tasks]. The default ("auto",
     when max_workers is unset) is one worker per report, capped at the CPU count
@@ -921,14 +926,20 @@ def _render_report_task(task: dict) -> dict:
 
 
 def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
-                      errors: list | None = None, stop_on_error: bool = False) -> list[dict]:
+                      errors: list | None = None, stop_on_error: bool = False,
+                      cancel=None) -> list[dict]:
     """Render all report tasks, sequentially (workers<=1) or across a process
     pool. Per-report progress is logged as each one finishes. A task that fails
     (e.g. a malformed input file) is logged and skipped (its slot stays None)
     so the other reports still build; the failure is recorded in `errors`.
-    With `stop_on_error`, the first failure aborts the whole run instead."""
+    With `stop_on_error`, the first failure aborts the whole run instead. If
+    `cancel` (a threading.Event) is set, the run stops promptly (pool workers
+    are terminated) and raises BuildCancelled."""
     n = len(tasks)
     results: list = [None] * n
+
+    def _cancelled():
+        return cancel is not None and cancel.is_set()
 
     def _failed(task, exc, done):
         if stop_on_error:
@@ -938,37 +949,67 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
         if errors is not None:
             errors.append((task['name'], str(exc)))
 
+    def _record(fut, i, task, done):
+        try:
+            results[i] = fut.result()
+            report_progress(f"  [{done}/{n}] rendered {results[i]['report_name']}")
+            # replay the child's captured per-report logs (they didn't stream
+            # live from the worker process); levels are preserved so the GUI
+            # colours them and the CLI prefixes them.
+            for lvl, msg in results[i].get('logs', ()):
+                log.log(lvl, "      %s", msg)
+        except Exception as exc:
+            _failed(task, exc, done)
+
     if workers <= 1:
         for i, task in enumerate(tasks):
+            if _cancelled():
+                raise BuildCancelled()
             try:
                 results[i] = _render_report_task(task)
                 report_progress(f"  [{i + 1}/{n}] rendered {results[i]['report_name']}")
+                for lvl, msg in results[i].get('logs', ()):
+                    log.log(lvl, "      %s", msg)
+            except BuildCancelled:
+                raise
             except Exception as exc:
                 _failed(task, exc, i + 1)
         return results
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
     # Recycle each worker after one report so its peak memory is returned to the
     # OS between reports (the big win for the 8-9 GB balloon); max_tasks_per_child
     # is Python 3.11+, so fall back gracefully on older interpreters.
     pool_kw = {'max_workers': workers}
     if sys.version_info >= (3, 11):
         pool_kw['max_tasks_per_child'] = 1
-    with ProcessPoolExecutor(**pool_kw) as pool:
+    pool = ProcessPoolExecutor(**pool_kw)
+    futs = {}
+    try:
         futs = {pool.submit(_render_report_task, t): (i, t) for i, t in enumerate(tasks)}
-        done = 0
-        for fut in as_completed(futs):
-            i, task = futs[fut]
-            done += 1
+        pending, done = set(futs), 0
+        while pending:
+            if _cancelled():
+                raise BuildCancelled()
+            # poll so a cancel is noticed within ~0.3s even mid-render
+            finished, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
+            for fut in finished:
+                i, task = futs[fut]
+                done += 1
+                _record(fut, i, task, done)
+    except BaseException:
+        # cancel queued work and terminate any still-running workers so a Stop
+        # (or a stop_on_error abort) doesn't leave child processes running
+        for f in futs:
+            f.cancel()
+        for proc in list(getattr(pool, '_processes', {}).values()):
             try:
-                results[i] = fut.result()
-                report_progress(f"  [{done}/{n}] rendered {results[i]['report_name']}")
-                # replay the child's captured per-report logs (they didn't stream
-                # live from the worker process); levels are preserved so the GUI
-                # colours them and the CLI prefixes them.
-                for lvl, msg in results[i].get('logs', ()):
-                    log.log(lvl, "      %s", msg)
-            except Exception as exc:
-                _failed(task, exc, done)
+                proc.terminate()
+            except Exception:
+                pass
+        raise
+    finally:
+        pool.shutdown(wait=False)
     return results
 
 
@@ -995,7 +1036,7 @@ def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallba
 
 def _build_separate_files(input_files, output_path, eff_rules, fmt, source_labels,
                           source_fallback, include_detailed, max_workers, report_progress,
-                          errors=None, stop_on_error=False):
+                          errors=None, stop_on_error=False, cancel=None):
     """One standalone workbook per report (Summary + Detailed + Source Tables),
     rendered in parallel. No index sheet (it's meaningless for single files)."""
     out_paths = _separate_out_paths(input_files, output_path)
@@ -1004,7 +1045,7 @@ def _build_separate_files(input_files, output_path, eff_rules, fmt, source_label
     workers = _resolve_workers(max_workers, len(tasks))
     report_progress(f"Rendering {len(tasks)} report(s) to separate files "
                     f"with {workers} worker process(es)...")
-    results = _run_report_tasks(tasks, workers, report_progress, errors, stop_on_error)
+    results = _run_report_tasks(tasks, workers, report_progress, errors, stop_on_error, cancel)
     return [r['out_path'] for r in results if r]
 
 
@@ -1164,7 +1205,7 @@ def _merge_xlsx(ordered_sheets: list[tuple], template_path: str, output_path: st
 
 def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labels,
                            source_fallback, include_detailed, max_workers, report_progress,
-                           errors=None, stop_on_error=False):
+                           errors=None, stop_on_error=False, cancel=None):
     """Render every report to a standalone file in parallel, then splice their
     Summary/Detailed sheets + a combined index + merged Source Tables into one
     workbook by raw XML assembly."""
@@ -1178,7 +1219,7 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
         workers = _resolve_workers(max_workers, len(tasks))
         report_progress(f"Rendering {len(tasks)} report(s) with {workers} worker process(es)...")
         results = [r for r in _run_report_tasks(tasks, workers, report_progress,
-                                                errors, stop_on_error) if r]
+                                                errors, stop_on_error, cancel) if r]
         if not results:
             return []          # every report failed; build_workbooks reports it
 
@@ -1276,7 +1317,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
                     include_detailed: bool = True, separate_detailed: bool = False,
                     unformatted: bool = False, combine: bool = True,
                     max_workers: int | None = None, write_error_log: bool = False,
-                    stop_on_error: bool = False, progress=None) -> list[str]:
+                    stop_on_error: bool = False, cancel=None, progress=None) -> list[str]:
     """Process every input file and write the output workbook(s).
     Returns the list of files written. `progress` is an optional callback(str).
 
@@ -1328,7 +1369,8 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     if not combine and not unformatted:
         written = _build_separate_files(input_files, output_path, eff_rules, fmt,
                                         source_labels, source_fallback, include_detailed,
-                                        max_workers, report_progress, errors, stop_on_error)
+                                        max_workers, report_progress, errors, stop_on_error,
+                                        cancel)
         for path in written:
             report_progress(f"Saved {path}")
         return _finish(written)
@@ -1341,7 +1383,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         try:
             return _finish(_build_combined_merged(
                 input_files, output_path, eff_rules, fmt, source_labels, source_fallback,
-                include_detailed, max_workers, report_progress, errors, stop_on_error))
+                include_detailed, max_workers, report_progress, errors, stop_on_error, cancel))
         except _StyleMergeMismatch as exc:
             report_progress(f"  Style tables diverged for '{exc}' - falling back to a "
                             f"serial combine to keep formatting correct.")
@@ -1351,6 +1393,8 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     # ---- build all lineage trees (serial: combined / unformatted) ----
     reports = []
     for path in input_files:
+        if cancel is not None and cancel.is_set():
+            raise BuildCancelled()
         try:
             builder = DataLineageBuilder(path, rules=rules).load()
             report_progress(f"Tracing lineage: {builder.report_name}")
@@ -1391,6 +1435,8 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     taken_main, taken_detail = {'list of reports', 'source tables'}, set()
     index_rows = []
     for rep in reports:
+        if cancel is not None and cancel.is_set():
+            raise BuildCancelled()
         builder = rep['builder']
         report_progress(f"Writing sheets: {builder.report_name}")
         summary_roots, expanded_at = rep['summary']

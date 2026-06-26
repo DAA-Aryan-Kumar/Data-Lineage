@@ -82,6 +82,7 @@ class LineageApp:
 
         self.log_queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.cancel_event: threading.Event | None = None   # set to stop a running build
         self.written_files: list[str] = []
         self._files: list[str] = []   # input report paths, in processing order
         self.dark = tk.BooleanVar(value=False)
@@ -307,12 +308,18 @@ class LineageApp:
         self.progress.pack(side='left')
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(bar, textvariable=self.status_var).pack(side='left', padx=10)
-        self.open_folder_btn = ttk.Button(bar, text="Open output folder",
-                                          command=self._open_folder, state='disabled')
-        self.open_folder_btn.pack(side='right')
+        # Packed right-to-left so the row reads [Stop | Open output folder |
+        # Open workbook]. Stop is active only during a build and the Open
+        # buttons only after, so they never compete and Stop isn't hit by
+        # mistake.
         self.open_file_btn = ttk.Button(bar, text="Open workbook",
                                         command=self._open_file, state='disabled')
-        self.open_file_btn.pack(side='right', padx=6)
+        self.open_file_btn.pack(side='right', padx=(6, 0))
+        self.open_folder_btn = ttk.Button(bar, text="Open output folder",
+                                          command=self._open_folder, state='disabled')
+        self.open_folder_btn.pack(side='right', padx=6)
+        self.stop_btn = ttk.Button(bar, text="■ Stop", command=self._stop, state='disabled')
+        self.stop_btn.pack(side='right', padx=6)
 
         self._add_watermark()
 
@@ -724,7 +731,9 @@ class LineageApp:
                 self.status_var.set("Cancelled")
                 return
         self._save_settings(silent=True)
+        self.cancel_event = threading.Event()
         self.run_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')
         self.open_file_btn.config(state='disabled')
         self.open_folder_btn.config(state='disabled')
         self.progress.start(12)
@@ -745,9 +754,19 @@ class LineageApp:
             max_workers=self.worker_count.get(),
             write_error_log=self.opt_error_log.get(),
             stop_on_error=self.opt_stop_on_error.get(),
+            cancel=self.cancel_event,
         )
         self.worker = threading.Thread(target=self._worker_main, args=(kwargs,), daemon=True)
         self.worker.start()
+
+    def _stop(self):
+        """Signal the running build to stop; it unwinds and terminates its
+        worker processes, then the poller resets the buttons."""
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+        self.stop_btn.config(state='disabled')
+        self.status_var.set("Stopping…")
+        self._log_line("\nStopping — terminating workers…", 'warn')
 
     def _worker_main(self, kwargs):
         handler = QueueLogHandler(self.log_queue)
@@ -758,6 +777,8 @@ class LineageApp:
             written = engine.build_workbooks(**kwargs)
             self.written_files = written
             self.log_queue.put(('DONE', written))
+        except engine.BuildCancelled:
+            self.log_queue.put(('CANCELLED', None))
         except Exception as exc:
             self.log_queue.put(('ERROR', str(exc)))
         finally:
@@ -775,6 +796,7 @@ class LineageApp:
                     kind, payload = item
                     self.progress.stop()
                     self.run_btn.config(state='normal')
+                    self.stop_btn.config(state='disabled')
                     if kind == 'DONE':
                         self.status_var.set("Done — " + os.path.basename(payload[0]))
                         self._log_line("\nFinished. Output:", 'ok')
@@ -785,6 +807,9 @@ class LineageApp:
                         self.open_file_btn.config(
                             state='normal' if len(payload) == 1 else 'disabled')
                         self.open_folder_btn.config(state='normal')
+                    elif kind == 'CANCELLED':
+                        self.status_var.set("Stopped")
+                        self._log_line("\nStopped. No output written.", 'warn')
                     else:
                         self.status_var.set("Failed")
                         self._log_line(f"\nERROR: {payload}", 'err')
