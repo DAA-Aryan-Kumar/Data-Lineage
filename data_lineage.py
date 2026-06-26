@@ -710,13 +710,137 @@ class ClientExcelRenderer:
 
 
 # ===========================================================================
+# PARALLEL RENDERING (one process per report)
+# ===========================================================================
+def _resolve_workers(max_workers, n_tasks: int) -> int:
+    """Clamp the worker count to [1, n_tasks], defaulting to cpu_count-1."""
+    if not max_workers or max_workers < 1:
+        max_workers = max(1, (os.cpu_count() or 2) - 1)
+    return max(1, min(int(max_workers), max(1, n_tasks)))
+
+
+def _source_rows(builder: 'DataLineageBuilder', renderer: 'ClientExcelRenderer', names) -> list[list]:
+    """[db, schema, object, type, label, consolidated-name] per source object."""
+    rows = []
+    for n in names:
+        m = builder.object_meta(n)
+        rows.append([m['Database'], m['Schema'], m['Name'], m['Type'],
+                     renderer.source_label(n, m), n])
+    return rows
+
+
+def _render_report_task(task: dict) -> dict:
+    """Worker (runs in a child process): build one report's lineage trees and
+    render them to a standalone .xlsx, returning picklable metadata + the source
+    rows the parent needs for the combined index / Source Tables sheets."""
+    import openpyxl
+    builder = DataLineageBuilder(task['path'], rules=task['rules']).load()
+    drop_s, drop_d = task['drop_summary'], task['drop_detailed']
+    s_roots, s_exp = builder.build_tree(summarize=True, drop_no_lineage=drop_s)
+    d_roots = d_exp = None
+    if task['include_detailed']:
+        d_roots, d_exp = builder.build_tree(summarize=False, drop_no_lineage=drop_d)
+
+    renderer = ClientExcelRenderer(task['fmt'], task['source_labels'], task['source_fallback'])
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    s_info = renderer.render_lineage_sheet(wb, task['summary_sheet'], builder,
+                                           s_roots, s_exp, link_dups=True)
+    d_info = None
+    if d_roots is not None:
+        d_info = renderer.render_lineage_sheet(wb, task['detailed_sheet'], builder,
+                                               d_roots, d_exp, link_dups=False)
+    if task['include_source']:
+        _add_source_rollup(wb, renderer, [{'builder': builder}])
+    out = _safe_save(wb, task['out_path'])
+    return {
+        'report_name': builder.report_name, 'out_path': out,
+        'input_basename': os.path.basename(builder.input_file_path),
+        'summary_sheet': task['summary_sheet'], 'detailed_sheet': task['detailed_sheet'],
+        'queries': s_info['queries'], 'max_depth': s_info['max_depth'],
+        'summary_rows': s_info['rows'], 'detailed_rows': (d_info['rows'] if d_info else '-'),
+        'source_count': len(builder.source_tables()),
+        'source_rows': _source_rows(builder, renderer, builder.source_tables()),
+        'rootless_rows': _source_rows(builder, renderer, builder.rootless_queries()),
+    }
+
+
+def _run_report_tasks(tasks: list[dict], workers: int, report_progress) -> list[dict]:
+    """Render all report tasks, sequentially (workers<=1) or across a process
+    pool. Per-report progress is logged as each one finishes."""
+    n = len(tasks)
+    results: list = [None] * n
+    if workers <= 1:
+        for i, task in enumerate(tasks):
+            results[i] = _render_report_task(task)
+            report_progress(f"  [{i + 1}/{n}] rendered {results[i]['report_name']}")
+        return results
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_render_report_task, t): i for i, t in enumerate(tasks)}
+        done = 0
+        for fut in as_completed(futs):
+            i = futs[fut]
+            results[i] = fut.result()
+            done += 1
+            report_progress(f"  [{done}/{n}] rendered {results[i]['report_name']}")
+    return results
+
+
+def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
+                       include_detailed, include_source, out_paths) -> list[dict]:
+    """Build per-report task dicts with globally-unique sheet names so the
+    rendered sheets never collide when merged and internal hyperlinks stay valid."""
+    drop_s = eff_rules.get('drop_no_lineage_summary', True)
+    drop_d = eff_rules.get('drop_no_lineage_detailed', True)
+    taken = {'list of reports', 'source tables'}
+    tasks = []
+    for path, out_path in zip(input_files, out_paths):
+        name = derive_report_name(path)
+        s_sheet = ClientExcelRenderer.safe_sheet_name(name, taken)
+        d_sheet = (ClientExcelRenderer.safe_sheet_name(name, taken, suffix=' (Detailed)')
+                   if include_detailed else None)
+        tasks.append({'path': path, 'rules': eff_rules, 'fmt': fmt,
+                      'source_labels': source_labels, 'source_fallback': source_fallback,
+                      'include_detailed': include_detailed, 'include_source': include_source,
+                      'drop_summary': drop_s, 'drop_detailed': drop_d,
+                      'summary_sheet': s_sheet, 'detailed_sheet': d_sheet, 'out_path': out_path})
+    return tasks
+
+
+def _build_separate_files(input_files, output_path, eff_rules, fmt, source_labels,
+                          source_fallback, include_detailed, max_workers, report_progress):
+    """One standalone workbook per report (Summary + Detailed + Source Tables),
+    rendered in parallel. No index sheet (it's meaningless for single files)."""
+    out_dir = os.path.dirname(output_path)
+    taken = set()
+    out_paths = []
+    for path in input_files:
+        base = re.sub(r"[\\/:*?\"<>|]", ' ', derive_report_name(path)).strip() or 'report'
+        cand, n = base, 2
+        while cand.lower() in taken:
+            cand = f'{base} ({n})'
+            n += 1
+        taken.add(cand.lower())
+        out_paths.append(os.path.join(out_dir, cand + '.xlsx'))
+    tasks = _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
+                               include_detailed, include_source=True, out_paths=out_paths)
+    workers = _resolve_workers(max_workers, len(tasks))
+    report_progress(f"Rendering {len(tasks)} report(s) to separate files "
+                    f"with {workers} worker process(es)...")
+    results = _run_report_tasks(tasks, workers, report_progress)
+    return [r['out_path'] for r in results if r]
+
+
+# ===========================================================================
 # WORKBOOK ASSEMBLY
 # ===========================================================================
 def build_workbooks(input_files: list[str], output_path: str | None = None,
                     rules: dict | None = None, fmt: dict | None = None,
                     source_labels: dict | None = None, source_fallback: str | None = None,
                     include_detailed: bool = True, separate_detailed: bool = False,
-                    unformatted: bool = False, progress=None) -> list[str]:
+                    unformatted: bool = False, combine: bool = True,
+                    max_workers: int | None = None, progress=None) -> list[str]:
     """Process every input file and write the output workbook(s).
     Returns the list of files written. `progress` is an optional callback(str).
 
@@ -740,7 +864,16 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         output_path = os.path.join(os.path.dirname(first), 'Data Lineage Workbook.xlsx')
     output_path = os.path.abspath(output_path)
 
-    # ---- build all lineage trees ----
+    # ---- one standalone file per report (parallel, no merge) ----
+    if not combine and not unformatted:
+        written = _build_separate_files(input_files, output_path, eff_rules, fmt,
+                                        source_labels, source_fallback, include_detailed,
+                                        max_workers, report_progress)
+        for path in written:
+            report_progress(f"Saved {path}")
+        return written
+
+    # ---- build all lineage trees (serial: combined / unformatted) ----
     reports = []
     for path in input_files:
         builder = DataLineageBuilder(path, rules=rules).load()
