@@ -998,20 +998,7 @@ def _build_separate_files(input_files, output_path, eff_rules, fmt, source_label
                           errors=None, stop_on_error=False):
     """One standalone workbook per report (Summary + Detailed + Source Tables),
     rendered in parallel. No index sheet (it's meaningless for single files)."""
-    out_dir = os.path.dirname(output_path)
-    if len(input_files) == 1:
-        out_paths = [output_path]   # honour the chosen path exactly for one report
-    else:
-        taken = set()
-        out_paths = []
-        for path in input_files:
-            base = re.sub(r"[\\/:*?\"<>|]", ' ', peek_report_name(path)).strip() or 'report'
-            cand, n = base, 2
-            while cand.lower() in taken:
-                cand = f'{base} ({n})'
-                n += 1
-            taken.add(cand.lower())
-            out_paths.append(os.path.join(out_dir, f'{cand} Lineage.xlsx'))
+    out_paths = _separate_out_paths(input_files, output_path)
     tasks = _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
                                include_detailed, include_source=True, out_paths=out_paths)
     workers = _resolve_workers(max_workers, len(tasks))
@@ -1226,6 +1213,63 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
 # ===========================================================================
 # WORKBOOK ASSEMBLY
 # ===========================================================================
+def _dedup_inputs(input_files: list[str]) -> list[str]:
+    """Drop duplicate input paths (normalised), keeping first-occurrence order."""
+    seen, out = set(), []
+    for f in input_files:
+        key = os.path.normcase(os.path.abspath(f))
+        if key not in seen:
+            seen.add(key)
+            out.append(f)
+    return out
+
+
+def _default_output_path(input_files: list[str]) -> str:
+    """Auto output path when none is given: a single report after its
+    dashboard/table ('<name> Lineage.xlsx'), else 'Data Lineage Workbook.xlsx',
+    next to the first input."""
+    first = os.path.abspath(input_files[0])
+    if len(input_files) == 1:
+        safe = re.sub(r'[\\/:*?"<>|]', ' ', peek_report_name(first)).strip()
+        name = f'{safe} Lineage.xlsx' if safe else 'Data Lineage Workbook.xlsx'
+    else:
+        name = 'Data Lineage Workbook.xlsx'
+    return os.path.join(os.path.dirname(first), name)
+
+
+def _separate_out_paths(input_files: list[str], output_path: str) -> list[str]:
+    """Per-report output paths for separate-files mode ('<name> Lineage.xlsx');
+    a single report honours output_path exactly."""
+    if len(input_files) == 1:
+        return [output_path]
+    out_dir = os.path.dirname(output_path)
+    taken, paths = set(), []
+    for path in input_files:
+        base = re.sub(r"[\\/:*?\"<>|]", ' ', peek_report_name(path)).strip() or 'report'
+        cand, n = base, 2
+        while cand.lower() in taken:
+            cand = f'{base} ({n})'
+            n += 1
+        taken.add(cand.lower())
+        paths.append(os.path.join(out_dir, f'{cand} Lineage.xlsx'))
+    return paths
+
+
+def _planned_outputs(input_files, output_path, combine, unformatted,
+                     separate_detailed) -> list[str]:
+    """The path(s) build_workbooks would write — for a pre-build overwrite check."""
+    if not input_files:
+        return []
+    input_files = _dedup_inputs(input_files)
+    output_path = os.path.abspath(output_path or _default_output_path(input_files))
+    if not combine and not unformatted:
+        return _separate_out_paths(input_files, output_path)
+    paths = [output_path]
+    if combine and not unformatted and separate_detailed:
+        paths.append(re.sub(r'\.xlsx$', '', output_path, flags=re.I) + ' (Detailed).xlsx')
+    return paths
+
+
 def build_workbooks(input_files: list[str], output_path: str | None = None,
                     rules: dict | None = None, fmt: dict | None = None,
                     source_labels: dict | None = None, source_fallback: str | None = None,
@@ -1272,25 +1316,12 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         raise ValueError("No input files provided.")
     # Drop duplicate inputs (same file listed twice) so the output never gets
     # duplicate sheets; keep first-occurrence order.
-    seen, deduped = set(), []
-    for f in input_files:
-        key = os.path.normcase(os.path.abspath(f))
-        if key not in seen:
-            seen.add(key)
-            deduped.append(f)
+    deduped = _dedup_inputs(input_files)
     if len(deduped) != len(input_files):
         report_progress(f"  Ignored {len(input_files) - len(deduped)} duplicate input(s).")
     input_files = deduped
     if output_path is None:
-        first = os.path.abspath(input_files[0])
-        # A single report names itself after its dashboard/table (data-driven);
-        # only a true multi-report combine gets the generic workbook name.
-        if len(input_files) == 1:
-            safe = re.sub(r'[\\/:*?"<>|]', ' ', peek_report_name(first)).strip()
-            default = f'{safe} Lineage.xlsx' if safe else 'Data Lineage Workbook.xlsx'
-        else:
-            default = 'Data Lineage Workbook.xlsx'
-        output_path = os.path.join(os.path.dirname(first), default)
+        output_path = _default_output_path(input_files)
     output_path = os.path.abspath(output_path)
 
     # ---- one standalone file per report (parallel, no merge) ----
@@ -1609,12 +1640,15 @@ def main(argv=None):
     parser.add_argument('--no-combine', action='store_true',
                         help="Write one workbook per report instead of merging into one")
     parser.add_argument('--workers', type=int, default=None,
-                        help="Number of worker processes for rendering (default: CPUs-1)")
+                        help="Max worker processes for rendering (default: one per "
+                             "report, capped at the CPU count)")
     parser.add_argument('--error-log', action='store_true',
                         help="Write skipped files to 'Lineage Errors.txt' in the output folder")
     parser.add_argument('--stop-on-error', action='store_true',
                         help="Abort the whole run on the first file that fails "
                              "(default: skip it and continue)")
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help="Overwrite existing output files without prompting")
     parser.add_argument('--drop-no-lineage', action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Ignore root queries that have no upstream lineage "
@@ -1657,6 +1691,23 @@ def main(argv=None):
                     "contains its own Detailed sheet.")
     if args.unformatted and args.separate:
         log.warning("--separate ignored: --unformatted writes a single raw workbook.")
+
+    # Confirm before overwriting existing output (skip with --yes).
+    if not args.yes:
+        existing = [p for p in _planned_outputs(inputs, args.output, not args.no_combine,
+                                                args.unformatted, args.separate)
+                    if os.path.exists(p)]
+        if existing:
+            print("These output file(s) already exist and will be overwritten:")
+            for p in existing:
+                print(f"  {p}")
+            try:
+                proceed = input("Proceed? [y/N]: ").strip().lower() in ('y', 'yes')
+            except EOFError:
+                proceed = False
+            if not proceed:
+                print("Cancelled.")
+                sys.exit(0)
 
     try:
         written = build_workbooks(inputs, args.output, rules=cli_rules,

@@ -706,6 +706,23 @@ class LineageApp:
         if missing:
             messagebox.showerror("File not found", "\n".join(missing))
             return
+        # confirm before overwriting any existing output (on the UI thread,
+        # before the build starts, so there's no cross-thread dialog)
+        try:
+            planned = engine._planned_outputs(
+                files, self.output_var.get().strip() or None,
+                self.opt_combine.get(), self.opt_unformatted.get(), self.opt_separate.get())
+        except Exception:
+            planned = []
+        existing = [p for p in planned if os.path.exists(p)]
+        if existing:
+            shown = "\n".join("  • " + os.path.basename(p) for p in existing[:12])
+            more = "" if len(existing) <= 12 else f"\n  …and {len(existing) - 12} more"
+            if not messagebox.askyesno(
+                    "Overwrite existing file(s)?",
+                    f"This will overwrite:\n\n{shown}{more}\n\nProceed?"):
+                self.status_var.set("Cancelled")
+                return
         self._save_settings(silent=True)
         self.run_btn.config(state='disabled')
         self.open_file_btn.config(state='disabled')
