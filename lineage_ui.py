@@ -296,16 +296,26 @@ class LineageApp:
                             "next to the first input file.",
                   style='Sub.TLabel').pack(anchor='w')
 
-        opts = ttk.LabelFrame(tab, text="Detailed sheets", padding=8)
+        opts = ttk.LabelFrame(tab, text="Output", padding=8)
         opts.pack(fill='x', pady=(10, 0))
         self.opt_detailed = tk.BooleanVar(value=True)
+        self.opt_combine = tk.BooleanVar(value=True)
         self.opt_separate = tk.BooleanVar(value=False)
+        self.worker_count = tk.IntVar(value=max(1, (os.cpu_count() or 2) - 1))
         ttk.Checkbutton(opts, text="Include Detailed sheets", variable=self.opt_detailed
                         ).grid(row=0, column=0, sticky='w', padx=6, pady=2)
+        ttk.Checkbutton(opts, text="Combine into one workbook", variable=self.opt_combine
+                        ).grid(row=0, column=1, sticky='w', padx=6, pady=2)
         self.sep_cb = ttk.Checkbutton(opts, text="Detailed sheets in a separate file",
                                       variable=self.opt_separate)
-        self.sep_cb.grid(row=0, column=1, sticky='w', padx=6, pady=2)
+        self.sep_cb.grid(row=1, column=0, sticky='w', padx=6, pady=2)
+        wrow = ttk.Frame(opts)
+        wrow.grid(row=1, column=1, sticky='w', padx=6, pady=2)
+        ttk.Label(wrow, text="Worker processes:").pack(side='left')
+        ttk.Spinbox(wrow, from_=1, to=max(1, os.cpu_count() or 8), width=4,
+                    textvariable=self.worker_count).pack(side='left', padx=4)
         self.opt_detailed.trace_add('write', self._toggle_detailed)
+        self.opt_combine.trace_add('write', self._toggle_detailed)
         self._toggle_detailed()
 
         actions = ttk.Frame(tab)
@@ -327,8 +337,10 @@ class LineageApp:
         self.log_text.config(yscrollcommand=log_scroll.set)
 
     def _toggle_detailed(self, *_):
-        """Disable the 'separate file' option when Detailed sheets are off."""
-        self.sep_cb.configure(state='normal' if self.opt_detailed.get() else 'disabled')
+        """'Detailed in a separate file' only applies to a combined workbook
+        that includes detailed sheets."""
+        ok = self.opt_detailed.get() and self.opt_combine.get()
+        self.sep_cb.configure(state='normal' if ok else 'disabled')
 
     # ---- tab 2: pruning rules -------------------------------------------------
     def _build_rules_tab(self):
@@ -575,6 +587,8 @@ class LineageApp:
             include_detailed=self.opt_detailed.get(),
             separate_detailed=self.opt_separate.get(),
             unformatted=self.opt_unformatted.get(),
+            combine=self.opt_combine.get(),
+            max_workers=self.worker_count.get(),
         )
         self.worker = threading.Thread(target=self._worker_main, args=(kwargs,), daemon=True)
         self.worker.start()
@@ -651,6 +665,8 @@ class LineageApp:
                 'include_detailed': self.opt_detailed.get(),
                 'separate_detailed': self.opt_separate.get(),
                 'unformatted': self.opt_unformatted.get(),
+                'combine': self.opt_combine.get(),
+                'workers': self.worker_count.get(),
                 'dark': self.dark.get(),
             },
         }
@@ -704,6 +720,8 @@ class LineageApp:
         self.opt_detailed.set(ui.get('include_detailed', True))
         self.opt_separate.set(ui.get('separate_detailed', False))
         self.opt_unformatted.set(ui.get('unformatted', False))
+        self.opt_combine.set(ui.get('combine', True))
+        self.worker_count.set(ui.get('workers', max(1, (os.cpu_count() or 2) - 1)))
         self.dark.set(ui.get('dark', False))
 
 

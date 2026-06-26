@@ -1356,6 +1356,8 @@ def load_config(path: str):
 
 
 def main(argv=None):
+    import multiprocessing
+    multiprocessing.freeze_support()   # safe re-entry for parallel worker processes
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     parser = argparse.ArgumentParser(
         description="Recursively expand data lineage from Atlan impact reports "
@@ -1369,6 +1371,10 @@ def main(argv=None):
                         help="Skip the Detailed sheets entirely")
     parser.add_argument('--unformatted', action='store_true',
                         help="Raw wide dump without client styling")
+    parser.add_argument('--no-combine', action='store_true',
+                        help="Write one workbook per report instead of merging into one")
+    parser.add_argument('--workers', type=int, default=None,
+                        help="Number of worker processes for rendering (default: CPUs-1)")
     parser.add_argument('--drop-no-lineage', action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Ignore root queries that have no upstream lineage "
@@ -1404,7 +1410,9 @@ def main(argv=None):
         written = build_workbooks(inputs, args.output, rules=cli_rules,
                                   include_detailed=not args.no_detailed,
                                   separate_detailed=args.separate,
-                                  unformatted=args.unformatted)
+                                  unformatted=args.unformatted,
+                                  combine=not args.no_combine,
+                                  max_workers=args.workers)
     except Exception as exc:
         log.error("Failed to process lineage: %s", exc)
         sys.exit(1)

@@ -105,6 +105,11 @@ def _run_gui():
 
 
 def main():
+    # MUST run first: in a frozen exe, the parallel render's worker processes
+    # re-launch this exe; freeze_support intercepts them (else they'd each open
+    # the GUI / re-run the build — a fork bomb).
+    import multiprocessing
+    multiprocessing.freeze_support()
     if len(sys.argv) > 1:
         import data_lineage
         data_lineage.main()
