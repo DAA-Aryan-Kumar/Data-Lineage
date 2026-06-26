@@ -854,46 +854,69 @@ def _source_rows(builder: 'DataLineageBuilder', renderer: 'ClientExcelRenderer',
     return rows
 
 
+class _ListLogHandler(logging.Handler):
+    """Collects (level, message) records into a list so a child process can ship
+    its per-report log lines back to the parent (child logs are otherwise lost
+    under the Windows 'spawn' start method)."""
+
+    def __init__(self, sink: list):
+        super().__init__()
+        self.sink = sink
+
+    def emit(self, record):
+        self.sink.append((record.levelno, self.format(record)))
+
+
 def _render_report_task(task: dict) -> dict:
     """Worker (runs in a child process): build one report's lineage trees and
     render them to a standalone .xlsx, returning picklable metadata + the source
-    rows the parent needs for the combined index / Source Tables sheets."""
+    rows the parent needs, plus the report's own log lines (captured here since
+    a spawned child shares no handler with the parent)."""
     import openpyxl
-    builder = DataLineageBuilder(task['path'], rules=task['rules']).load()
-    drop_s, drop_d = task['drop_summary'], task['drop_detailed']
-    s_roots, s_exp = builder.build_tree(summarize=True, drop_no_lineage=drop_s)
-    d_roots = d_exp = None
-    if task['include_detailed']:
-        d_roots, d_exp = builder.build_tree(summarize=False, drop_no_lineage=drop_d)
+    captured: list = []
+    handler = _ListLogHandler(captured)
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    try:
+        builder = DataLineageBuilder(task['path'], rules=task['rules']).load()
+        drop_s, drop_d = task['drop_summary'], task['drop_detailed']
+        s_roots, s_exp = builder.build_tree(summarize=True, drop_no_lineage=drop_s)
+        d_roots = d_exp = None
+        if task['include_detailed']:
+            d_roots, d_exp = builder.build_tree(summarize=False, drop_no_lineage=drop_d)
 
-    renderer = ClientExcelRenderer(task['fmt'], task['source_labels'], task['source_fallback'])
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
-    if task.get('seed'):                       # for merge: identical styles.xml across files
-        renderer.seed_styles(wb)
-    s_info = renderer.render_lineage_sheet(wb, task['summary_sheet'], builder,
-                                           s_roots, s_exp, link_dups=True)
-    d_info = None
-    if d_roots is not None:
-        d_info = renderer.render_lineage_sheet(wb, task['detailed_sheet'], builder,
-                                               d_roots, d_exp, link_dups=False)
-    if task['include_source']:
-        _add_source_rollup(wb, renderer, [{'builder': builder}])
-    out = _safe_save(wb, task['out_path'])
-    result = {
-        'report_name': builder.report_name, 'out_path': out,
-        'input_basename': os.path.basename(builder.input_file_path),
-        'summary_sheet': task['summary_sheet'], 'detailed_sheet': task['detailed_sheet'],
-        'queries': s_info['queries'], 'max_depth': s_info['max_depth'],
-        'summary_rows': s_info['rows'], 'detailed_rows': (d_info['rows'] if d_info else '-'),
-        'source_count': len(builder.source_tables()),
-        'source_rows': _source_rows(builder, renderer, builder.source_tables()),
-        'rootless_rows': _source_rows(builder, renderer, builder.rootless_queries()),
-    }
-    # release the report's heavy objects before the worker takes the next task
-    # (matters when a worker is reused, i.e. there are more reports than workers)
-    del wb, builder, s_roots, s_exp, d_roots, d_exp
-    gc.collect()
+        renderer = ClientExcelRenderer(task['fmt'], task['source_labels'], task['source_fallback'])
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        if task.get('seed'):                       # for merge: identical styles.xml across files
+            renderer.seed_styles(wb)
+        s_info = renderer.render_lineage_sheet(wb, task['summary_sheet'], builder,
+                                               s_roots, s_exp, link_dups=True)
+        d_info = None
+        if d_roots is not None:
+            d_info = renderer.render_lineage_sheet(wb, task['detailed_sheet'], builder,
+                                                   d_roots, d_exp, link_dups=False)
+        if task['include_source']:
+            _add_source_rollup(wb, renderer, [{'builder': builder}])
+        out = _safe_save(wb, task['out_path'])
+        result = {
+            'report_name': builder.report_name, 'out_path': out,
+            'input_basename': os.path.basename(builder.input_file_path),
+            'summary_sheet': task['summary_sheet'], 'detailed_sheet': task['detailed_sheet'],
+            'queries': s_info['queries'], 'max_depth': s_info['max_depth'],
+            'summary_rows': s_info['rows'], 'detailed_rows': (d_info['rows'] if d_info else '-'),
+            'source_count': len(builder.source_tables()),
+            'source_rows': _source_rows(builder, renderer, builder.source_tables()),
+            'rootless_rows': _source_rows(builder, renderer, builder.rootless_queries()),
+        }
+        # release the report's heavy objects before the worker takes the next
+        # task (matters when a worker is reused: more reports than workers)
+        del wb, builder, s_roots, s_exp, d_roots, d_exp
+        gc.collect()
+    finally:
+        log.removeHandler(handler)
+    result['logs'] = captured
     return result
 
 
@@ -939,6 +962,11 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
             try:
                 results[i] = fut.result()
                 report_progress(f"  [{done}/{n}] rendered {results[i]['report_name']}")
+                # replay the child's captured per-report logs (they didn't stream
+                # live from the worker process); levels are preserved so the GUI
+                # colours them and the CLI prefixes them.
+                for lvl, msg in results[i].get('logs', ()):
+                    log.log(lvl, "      %s", msg)
             except Exception as exc:
                 _failed(task, exc, done)
     return results
