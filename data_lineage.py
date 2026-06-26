@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -834,9 +835,12 @@ class ClientExcelRenderer:
 # PARALLEL RENDERING (one process per report)
 # ===========================================================================
 def _resolve_workers(max_workers, n_tasks: int) -> int:
-    """Clamp the worker count to [1, n_tasks], defaulting to cpu_count-1."""
+    """Resolve the worker count, clamped to [1, n_tasks]. The default ("auto",
+    when max_workers is unset) is one worker per report, capped at the CPU count
+    -- more processes than cores can't speed up the CPU-bound rendering and only
+    multiplies peak memory. An explicit max_workers acts as an upper cap."""
     if not max_workers or max_workers < 1:
-        max_workers = max(1, (os.cpu_count() or 2) - 1)
+        max_workers = os.cpu_count() or 2
     return max(1, min(int(max_workers), max(1, n_tasks)))
 
 
@@ -876,7 +880,7 @@ def _render_report_task(task: dict) -> dict:
     if task['include_source']:
         _add_source_rollup(wb, renderer, [{'builder': builder}])
     out = _safe_save(wb, task['out_path'])
-    return {
+    result = {
         'report_name': builder.report_name, 'out_path': out,
         'input_basename': os.path.basename(builder.input_file_path),
         'summary_sheet': task['summary_sheet'], 'detailed_sheet': task['detailed_sheet'],
@@ -886,6 +890,11 @@ def _render_report_task(task: dict) -> dict:
         'source_rows': _source_rows(builder, renderer, builder.source_tables()),
         'rootless_rows': _source_rows(builder, renderer, builder.rootless_queries()),
     }
+    # release the report's heavy objects before the worker takes the next task
+    # (matters when a worker is reused, i.e. there are more reports than workers)
+    del wb, builder, s_roots, s_exp, d_roots, d_exp
+    gc.collect()
+    return result
 
 
 def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
@@ -915,7 +924,13 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
                 _failed(task, exc, i + 1)
         return results
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    # Recycle each worker after one report so its peak memory is returned to the
+    # OS between reports (the big win for the 8-9 GB balloon); max_tasks_per_child
+    # is Python 3.11+, so fall back gracefully on older interpreters.
+    pool_kw = {'max_workers': workers}
+    if sys.version_info >= (3, 11):
+        pool_kw['max_tasks_per_child'] = 1
+    with ProcessPoolExecutor(**pool_kw) as pool:
         futs = {pool.submit(_render_report_task, t): (i, t) for i, t in enumerate(tasks)}
         done = 0
         for fut in as_completed(futs):

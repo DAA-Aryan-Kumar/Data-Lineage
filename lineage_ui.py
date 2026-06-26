@@ -397,7 +397,7 @@ class LineageApp:
         self.opt_detailed = tk.BooleanVar(value=True)
         self.opt_combine = tk.BooleanVar(value=True)
         self.opt_separate = tk.BooleanVar(value=False)
-        self.worker_count = tk.IntVar(value=max(1, (os.cpu_count() or 2) - 1))
+        self.worker_count = tk.IntVar(value=os.cpu_count() or 4)
 
         opts = ttk.Frame(tab)
         opts.pack(fill='x', pady=(10, 0))
@@ -879,7 +879,7 @@ class LineageApp:
         self.opt_separate.set(ui.get('separate_detailed', False))
         self.opt_unformatted.set(ui.get('unformatted', False))
         self.opt_combine.set(ui.get('combine', True))
-        self.worker_count.set(ui.get('workers', max(1, (os.cpu_count() or 2) - 1)))
+        self.worker_count.set(ui.get('workers', os.cpu_count() or 4))
         self.opt_error_log.set(ui.get('error_log', False))
         self.opt_stop_on_error.set(ui.get('stop_on_error', False))
         self.dark.set(ui.get('dark', False))
