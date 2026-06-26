@@ -72,8 +72,12 @@ class LineageApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Data Lineage Builder")
-        root.geometry("980x720")
-        root.minsize(840, 600)
+        # Fit the window within the screen so nothing is clipped on shorter
+        # displays (dark mode's clam widgets are a touch taller); tab content
+        # scrolls, and the action bar stays pinned at the bottom.
+        sh = root.winfo_screenheight()
+        root.geometry(f"980x{min(720, max(520, sh - 90))}")
+        root.minsize(820, 460)
         self._set_window_icon()
 
         self.log_queue: queue.Queue = queue.Queue()
@@ -82,6 +86,8 @@ class LineageApp:
         self._files: list[str] = []   # input report paths, in processing order
         self.dark = tk.BooleanVar(value=False)
         self._themed = []   # (tk widget, light_bg, light_fg) recoloured on theme switch
+        self._canvases = []           # scrollable-tab canvases (recoloured on theme switch)
+        self._tab_canvases = {}       # notebook tab path -> its canvas (for mouse wheel)
         self._watermark_lbl = None
 
         self._apply_theme()
@@ -152,6 +158,8 @@ class LineageApp:
                 _safe_config(w, bg=lbg, fg=lfg, insertbackground=lfg,
                              selectbackground='#cce8ff', selectforeground='#000000',
                              highlightbackground='SystemButtonFace')
+            for c in self._canvases:
+                _safe_config(c, bg='SystemButtonFace')
             if self._watermark_lbl:
                 self._watermark_lbl.configure(background='SystemButtonFace', foreground='#C2C2C2')
             self._apply_log_tags()
@@ -192,6 +200,8 @@ class LineageApp:
             _safe_config(w, bg=FIELD, fg=FG, insertbackground=FG,
                          selectbackground=SEL, selectforeground='#ffffff',
                          highlightbackground=BG)
+        for c in self._canvases:
+            _safe_config(c, bg=BG)
         if self._watermark_lbl:
             self._watermark_lbl.configure(background=BG, foreground='#5e5e5e')
         self._apply_log_tags()
@@ -247,6 +257,34 @@ class LineageApp:
         except tk.TclError:
             pass
 
+    def _scrollable(self, outer):
+        """Return a padded inner frame inside a vertically-scrollable canvas that
+        fills `outer` (a notebook tab). Content taller than the viewport scrolls;
+        shorter content stretches to fill (so e.g. the log box still expands)."""
+        canvas = tk.Canvas(outer, highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        inner = ttk.Frame(canvas, padding=12)
+        win = canvas.create_window((0, 0), window=inner, anchor='nw')
+
+        def _sync(_=None):
+            cw, ch = canvas.winfo_width(), canvas.winfo_height()
+            canvas.itemconfigure(win, width=cw, height=max(inner.winfo_reqheight(), ch))
+            canvas.configure(scrollregion=(0, 0, cw, inner.winfo_reqheight()))
+        inner.bind('<Configure>', _sync)
+        canvas.bind('<Configure>', _sync)
+        self._canvases.append(canvas)
+        self._tab_canvases[str(outer)] = canvas
+        return inner
+
+    def _on_mousewheel(self, event):
+        """Scroll the visible tab's canvas (one wheel binding for all tabs)."""
+        cvs = self._tab_canvases.get(self.notebook.select())
+        if cvs is not None:
+            cvs.yview_scroll(-1 if event.delta > 0 else 1, 'units')
+
     def _build_layout(self):
         header = ttk.Frame(self.root, padding=(16, 12, 16, 4))
         header.pack(fill='x')
@@ -260,6 +298,7 @@ class LineageApp:
         self._build_run_tab()
         self._build_rules_tab()
         self._build_format_tab()
+        self.root.bind_all('<MouseWheel>', self._on_mousewheel)
 
         # status bar
         bar = ttk.Frame(self.root, padding=(16, 4, 16, 8))
@@ -316,8 +355,9 @@ class LineageApp:
 
     # ---- tab 1: run ----------------------------------------------------------
     def _build_run_tab(self):
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text='  Run  ')
+        outer = ttk.Frame(self.notebook)
+        self.notebook.add(outer, text='  Run  ')
+        tab = self._scrollable(outer)
 
         topbar = ttk.Frame(tab)
         topbar.pack(fill='x')
@@ -421,8 +461,9 @@ class LineageApp:
 
     # ---- tab 2: pruning rules -------------------------------------------------
     def _build_rules_tab(self):
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text='  Pruning Rules  ')
+        outer = ttk.Frame(self.notebook)
+        self.notebook.add(outer, text='  Pruning Rules  ')
+        tab = self._scrollable(outer)
 
         # --- per-sheet toggles at the top ---
         self.drop_summary = tk.BooleanVar(value=True)
@@ -498,8 +539,9 @@ class LineageApp:
 
     # ---- tab 3: formatting & sources -----------------------------------------
     def _build_format_tab(self):
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text='  Formatting & Sources  ')
+        outer = ttk.Frame(self.notebook)
+        self.notebook.add(outer, text='  Formatting & Sources  ')
+        tab = self._scrollable(outer)
         self._fmt_lockable = []   # widgets disabled while "Unformatted" is on
 
         self.opt_unformatted = tk.BooleanVar(value=False)
