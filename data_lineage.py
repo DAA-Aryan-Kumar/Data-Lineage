@@ -36,36 +36,37 @@ import pandas as pd
 log = logging.getLogger("data_lineage")
 
 # --------------------------------------------------------------------------
-# CONFIGURATION: TRIVIAL RULES
-# Toggle these rules / edit the lists to control what gets expanded.
-# A JSON file passed via --config (or edited in the GUI) overrides them.
+# CONFIGURATION: PRUNING RULES
+# Every list holds glob patterns matched against an object's
+# DATABASE.SCHEMA.OBJECT triple. '*' matches within a segment; entries with
+# fewer than three segments auto-pad with '.*' (so 'TEMP_DB' -> 'TEMP_DB.*.*'
+# and 'DB.SCHEMA' -> 'DB.SCHEMA.*'). '*.*.*' matches everything (logged).
+# Matching is case-insensitive unless the section's *_match_case flag is on
+# (Snowflake quoted identifiers are case-sensitive). A JSON file passed via
+# --config (or the GUI) overrides these.
 # --------------------------------------------------------------------------
 TRIVIAL_RULES = {
-    # a. Stop expanding if the object matches database.schema.name,
-    #    database.schema, or database.
-    'enable_namespace_blocking': True,
-    'blocked_namespaces': [
-        'PROD_DATALAKE.LOGS',        # blocks everything in the LOGS schema
-        'TEMP_DB',                   # blocks the entire TEMP_DB database
-    ],
+    # Objects that must NOT appear in the output at all (hidden and not expanded).
+    'exclude_patterns': [],
+    'exclude_match_case': False,
 
-    # b. Stop expanding the listed tables once they sit at/above this level.
-    #    Put "ALL" in the list for a blanket stop on every table.
-    'enable_high_level_tables': True,
-    'high_level_tables_limit': 8,
-    'high_level_tables': [
-        'PROD_EDW.ENT.COMMON_DIM',
-    ],
+    # Objects shown in the output, but whose upstream is NOT expanded.
+    'block_patterns': [],
+    'block_match_case': False,
 
-    # c. Same as (b) but for views.
-    'enable_high_level_views': True,
-    'high_level_views_limit': 8,
-    'high_level_views': [
-        'PROD_EDW.VIEWS.COMMON_VW',
-    ],
+    # Stop expanding matching TABLES once they sit beyond this level.
+    'table_patterns': [],
+    'table_level': 8,
+    'table_match_case': False,
 
-    # Apply the pruning rules to the Detailed sheets as well.
-    'apply_rules_to_detailed': False,
+    # Stop expanding matching VIEWS once they sit beyond this level.
+    'view_patterns': [],
+    'view_level': 8,
+    'view_match_case': False,
+
+    # Which sheet sets the rules apply to.
+    'apply_to_summary': True,
+    'apply_to_detailed': False,
 }
 
 # --------------------------------------------------------------------------
@@ -96,14 +97,17 @@ EXCEL_FORMAT = {
 
 # --------------------------------------------------------------------------
 # CONFIGURATION: "List of sources" labels
-# Longest matching prefix of the leaf's consolidated name wins.
-# Fallback when nothing matches: 'schema', 'db' or 'blank'.
+# 'glob pattern' : 'label', using the same DATABASE.SCHEMA.OBJECT glob syntax
+# as the pruning rules. The FIRST matching pattern (top-to-bottom) wins, so
+# ordering sets priority. Fallback when nothing matches: 'schema', 'db' or
+# 'blank'. Matching honours SOURCE_LABEL_MATCH_CASE.
 # --------------------------------------------------------------------------
 SOURCE_LABELS = {
-    'PROD_DATALAKE.CRM_MSCRM': 'CRM',
-    'PROD_DATALAKE.LAWPROD': 'LAWSON',
-    'DATALAKE.PUBLIC': 'LAWSON',
+    'PROD_DATALAKE.CRM_MSCRM.*': 'CRM',
+    'PROD_DATALAKE.LAWPROD.*': 'LAWSON',
+    'DATALAKE.PUBLIC.*': 'LAWSON',
 }
+SOURCE_LABEL_MATCH_CASE = False
 SOURCE_LABEL_FALLBACK = 'schema'
 
 NBSP = ' '
@@ -115,6 +119,51 @@ ST_DUP = 'duplicate'            # pruned: already expanded elsewhere
 ST_RULE = 'rule'                # pruned: matched a trivial rule
 ST_CYCLE = 'cycle'              # pruned: all children already on this path
 ST_NO_UPSTREAM = 'no_upstream'  # root object with no lineage in the report
+
+
+# --------------------------------------------------------------------------
+# GLOB NAMESPACE MATCHING (shared by pruning rules and source labels)
+# --------------------------------------------------------------------------
+def _clean_field(value) -> str:
+    """A metadata field as a plain string, with NaN/None -> ''."""
+    if value is None or (isinstance(value, float) and value != value):
+        return ''
+    return str(value)
+
+
+def compile_patterns(patterns, case_sensitive: bool):
+    """Compile glob patterns into [(original, [db_re, schema_re, object_re]), ...].
+    Each pattern is split on '.' into at most three segments (db, schema,
+    object), padded with '*' to three, then each segment glob-compiled. A
+    pattern that reduces to '*.*.*' (matches everything) is flagged in the log
+    but still compiled."""
+    flags = 0 if case_sensitive else re.IGNORECASE
+    compiled = []
+    for pat in patterns:
+        pat = pat.strip()
+        if not pat:
+            continue
+        parts = pat.split('.')
+        if len(parts) < 3:
+            parts = parts + ['*'] * (3 - len(parts))
+        elif len(parts) > 3:                       # object name containing dots
+            parts = parts[:2] + ['.'.join(parts[2:])]
+        if all(p.strip() == '*' for p in parts):
+            log.warning("Rule '%s' matches every object - applying it anyway.", pat)
+        seg_res = [re.compile(re.escape(seg).replace(r'\*', '.*').replace(r'\?', '.') + r'\Z',
+                              flags)
+                   for seg in parts]
+        compiled.append((pat, seg_res))
+    return compiled
+
+
+def match_patterns(fields, compiled):
+    """Return the first pattern in `compiled` whose three segment-regexes all
+    match the (db, schema, object) `fields`, or None."""
+    for pat, seg_res in compiled:
+        if all(rx.match(f) for rx, f in zip(seg_res, fields)):
+            return pat
+    return None
 
 
 class Node:
@@ -165,6 +214,7 @@ class DataLineageBuilder:
         self.details: dict[str, dict] = {}     # name -> {Database, Schema, Name, Type}
         self.adjacency: dict[str, tuple] = {}  # name -> upstream names, in order
         self.roots: list[str] = []             # objects at the minimum lineage depth
+        self._rc_exclude = self._rc_block = self._rc_table = self._rc_view = []
 
     # -- loading / preprocessing -------------------------------------------
     def load(self):
@@ -242,35 +292,63 @@ class DataLineageBuilder:
         return {'Database': '', 'Schema': '', 'Name': name, 'Type': ''}
 
     # -- pruning rules -------------------------------------------------------
-    def _trivial_reason(self, name: str, level: int) -> str | None:
-        rules = self.rules
-        if rules.get('enable_namespace_blocking'):
-            for ns in rules.get('blocked_namespaces', []):
-                if name == ns or name.startswith(ns + '.'):
-                    return f'Not expanded: blocked namespace {ns}'
-        obj_type = str(self.object_meta(name).get('Type', '')).upper()
-        for kind, flag, limit_key, list_key in (
-                ('TABLE', 'enable_high_level_tables', 'high_level_tables_limit', 'high_level_tables'),
-                ('VIEW', 'enable_high_level_views', 'high_level_views_limit', 'high_level_views')):
-            if kind in obj_type and rules.get(flag):
-                limit = rules.get(limit_key, 99)
-                targets = rules.get(list_key, [])
-                if level >= limit and ('ALL' in (t.upper() for t in targets) or name in targets):
-                    return f'Not expanded: {kind.lower()} at level L{level} >= L{limit}'
-        return None
+    def _compile_rules(self):
+        """Compile each rule section's glob patterns once per build."""
+        r = self.rules
+        self._rc_exclude = compile_patterns(r.get('exclude_patterns', []),
+                                            r.get('exclude_match_case', False))
+        self._rc_block = compile_patterns(r.get('block_patterns', []),
+                                          r.get('block_match_case', False))
+        self._rc_table = compile_patterns(r.get('table_patterns', []),
+                                          r.get('table_match_case', False))
+        self._rc_view = compile_patterns(r.get('view_patterns', []),
+                                         r.get('view_match_case', False))
+
+    def _rule_action(self, name: str, level: int) -> tuple[str, str | None]:
+        """Decide what happens to a node: 'exclude' (hide it entirely),
+        'block'/'stop' (show it but do not expand its upstream), or 'expand'.
+        Returns (action, remark)."""
+        meta = self.object_meta(name)
+        fields = (_clean_field(meta.get('Database')),
+                  _clean_field(meta.get('Schema')),
+                  _clean_field(meta.get('Name')))
+        if match_patterns(fields, self._rc_exclude):
+            return 'exclude', None
+        if match_patterns(fields, self._rc_block):
+            return 'block', 'Not expanded: matched a block rule'
+        obj_type = str(meta.get('Type') or '').upper()
+        if 'TABLE' in obj_type and self._rc_table:
+            limit = self.rules.get('table_level', 99)
+            if level > limit and match_patterns(fields, self._rc_table):
+                return 'stop', f'Not expanded: table beyond level L{limit}'
+        if 'VIEW' in obj_type and self._rc_view:
+            limit = self.rules.get('view_level', 99)
+            if level > limit and match_patterns(fields, self._rc_view):
+                return 'stop', f'Not expanded: view beyond level L{limit}'
+        return 'expand', None
 
     # -- tree building -------------------------------------------------------
     def _min_depths(self, apply_rules: bool) -> dict[str, int]:
-        """BFS shortest depth per reachable node, honouring pruning rules."""
-        depth = {r: 0 for r in self.roots}
-        queue = deque(self.roots)
+        """BFS shortest depth per reachable node, honouring pruning rules.
+        Excluded objects are unreachable; blocked/stopped objects appear but
+        their upstream is not traversed."""
+        depth = {}
+        queue = deque()
+        for r in self.roots:
+            if apply_rules and self._rule_action(r, 0)[0] == 'exclude':
+                continue
+            depth[r] = 0
+            queue.append(r)
         while queue:
             name = queue.popleft()
-            if apply_rules and self._trivial_reason(name, depth[name]):
+            if apply_rules and self._rule_action(name, depth[name])[0] != 'expand':
                 continue
             for child in self.adjacency.get(name, ()):
+                clevel = depth[name] + 1
+                if apply_rules and self._rule_action(child, clevel)[0] == 'exclude':
+                    continue
                 if child not in depth:
-                    depth[child] = depth[name] + 1
+                    depth[child] = clevel
                     queue.append(child)
         return depth
 
@@ -286,11 +364,17 @@ class DataLineageBuilder:
         than emitted as a lone Query row.
         """
         sys.setrecursionlimit(max(sys.getrecursionlimit(), 50_000))
-        apply_rules = summarize or self.rules.get('apply_rules_to_detailed', False)
+        self._compile_rules()
+        apply_rules = (self.rules.get('apply_to_summary', True) if summarize
+                       else self.rules.get('apply_to_detailed', False))
         min_depth = self._min_depths(apply_rules) if summarize else {}
         expanded_at: dict[str, Node] = {}
 
-        def make(name: str, level: int, path: frozenset) -> Node:
+        def make(name: str, level: int, path: frozenset) -> Node | None:
+            action, reason = (self._rule_action(name, level) if apply_rules
+                              else ('expand', None))
+            if action == 'exclude':
+                return None
             node = Node(name, level)
             children = self.adjacency.get(name, ())
             if not children:
@@ -298,11 +382,9 @@ class DataLineageBuilder:
                 if level == 0:
                     node.remark = 'No upstream lineage found in the impact report'
                 return node
-            if apply_rules:
-                reason = self._trivial_reason(name, level)
-                if reason:
-                    node.status, node.remark = ST_RULE, reason
-                    return node
+            if action in ('block', 'stop'):
+                node.status, node.remark = ST_RULE, reason
+                return node
             if summarize and (name in expanded_at or level != min_depth.get(name, level)):
                 node.status = ST_DUP
                 return node
@@ -314,7 +396,8 @@ class DataLineageBuilder:
             if summarize:
                 expanded_at[name] = node
             child_path = path | {name}
-            node.children = [make(c, level + 1, child_path) for c in kids]
+            node.children = [n for n in (make(c, level + 1, child_path) for c in kids)
+                             if n is not None]
             return node
 
         root_names = self.roots
@@ -324,7 +407,7 @@ class DataLineageBuilder:
             if dropped:
                 log.info("  Ignoring %d root object(s) with no upstream lineage", dropped)
 
-        roots = [make(r, 0, frozenset()) for r in root_names]
+        roots = [n for n in (make(r, 0, frozenset()) for r in root_names) if n is not None]
         mode = 'summary' if summarize else 'detailed'
         log.info("  Built %s tree: %d rows, max depth L%d", mode,
                  sum(1 for r in roots for _ in r.leaves()),
@@ -353,13 +436,21 @@ class ClientExcelRenderer:
     DATA_START_ROW = 4   # row 1 blank, row 2 group header, row 3 sub header
 
     def __init__(self, fmt: dict | None = None, source_labels: dict | None = None,
-                 source_fallback: str | None = None):
+                 source_fallback: str | None = None, source_match_case: bool | None = None):
         from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
         self.fmt = EXCEL_FORMAT if fmt is None else fmt
-        self.source_labels = SOURCE_LABELS if source_labels is None else source_labels
+        labels = SOURCE_LABELS if source_labels is None else source_labels
         self.source_fallback = (SOURCE_LABEL_FALLBACK if source_fallback is None
                                 else source_fallback)
+        match_case = (SOURCE_LABEL_MATCH_CASE if source_match_case is None
+                      else source_match_case)
+        # Compile labels to (label, seg_res) preserving order (first match wins).
+        self._source_labels = []
+        for pat, label in labels.items():
+            comp = compile_patterns([pat], match_case)
+            if comp:
+                self._source_labels.append((label, comp[0][1]))
         f = self.fmt
         self.font_data = Font(name=f['font_name'], size=f['font_size'])
         self.font_data_bold = Font(name=f['font_name'], size=f['font_size'], bold=True)
@@ -381,29 +472,51 @@ class ClientExcelRenderer:
 
     # -- helpers -------------------------------------------------------------
     def source_label(self, name: str, meta: dict) -> str:
-        best = ''
-        for prefix, label in self.source_labels.items():
-            if (name == prefix or name.startswith(prefix + '.')) and len(prefix) > len(best):
-                best, match = prefix, label
-        if best:
-            return match
-        # NaN is truthy, so `value or ''` would leak the string 'nan'; guard it.
-        def clean(value):
-            return '' if value is None or (isinstance(value, float) and value != value) else str(value)
+        fields = (_clean_field(meta.get('Database')),
+                  _clean_field(meta.get('Schema')),
+                  _clean_field(meta.get('Name')))
+        for label, seg_res in self._source_labels:        # first match wins
+            if all(rx.match(f) for rx, f in zip(seg_res, fields)):
+                return label
         if self.source_fallback == 'schema':
-            return clean(meta.get('Schema'))
+            return _clean_field(meta.get('Schema'))
         if self.source_fallback == 'db':
-            return clean(meta.get('Database'))
+            return _clean_field(meta.get('Database'))
         return ''
+
+    # Low-information words dropped first when abbreviating a long sheet name.
+    _SHEET_FILLER = ('Dashboard', 'Report', 'Analysis', 'Analytics', 'Activity',
+                     'Program', 'Center', 'Data')
 
     @staticmethod
     def safe_sheet_name(name: str, taken: set, suffix: str = '') -> str:
-        clean = re.sub(r"[\[\]:*?/\\']", ' ', name).strip()
-        base = (clean[:31 - len(suffix)] + suffix).strip()
-        candidate, n = base, 2
-        while candidate.lower() in taken:
+        """Fit a report name into Excel's 31-char sheet-name limit by smart
+        abbreviation: strip illegal chars, drop filler words, then shorten
+        words, before any hard truncation. Ensures uniqueness within `taken`."""
+        clean = re.sub(r"[\[\]:*?/\\']", ' ', str(name))
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        budget = 31 - len(suffix)
+
+        candidate = clean
+        if len(candidate) > budget:                       # 1. drop filler words
+            words = candidate.split(' ')
+            for fw in ClientExcelRenderer._SHEET_FILLER:
+                if len(' '.join(words)) <= budget:
+                    break
+                trimmed = [w for w in words if w.lower() != fw.lower()]
+                words = trimmed or words
+            candidate = ' '.join(words)
+        if len(candidate) > budget:                       # 2. shorten each word
+            words = candidate.split(' ')
+            candidate = ' '.join(w[:4] for w in words)
+        if len(candidate) > budget:                       # 3. last-resort truncate
+            candidate = candidate[:budget].rstrip()
+
+        candidate = (candidate + suffix).strip()
+        base, n = candidate, 2
+        while candidate.lower() in taken:                 # 4. ensure uniqueness
             tail = f' ({n})'
-            candidate = base[:31 - len(tail)] + tail
+            candidate = base[:31 - len(tail)].rstrip() + tail
             n += 1
         taken.add(candidate.lower())
         return candidate
@@ -604,6 +717,7 @@ class ClientExcelRenderer:
 def build_workbooks(input_files: list[str], output_path: str | None = None,
                     rules: dict | None = None, fmt: dict | None = None,
                     source_labels: dict | None = None, source_fallback: str | None = None,
+                    source_match_case: bool | None = None,
                     include_detailed: bool = True, separate_detailed: bool = False,
                     unformatted: bool = False, drop_no_lineage: bool = True,
                     progress=None) -> list[str]:
@@ -623,10 +737,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         raise ValueError("No input files provided.")
     if output_path is None:
         first = os.path.abspath(input_files[0])
-        if len(input_files) == 1:
-            output_path = os.path.splitext(first)[0] + '__Lineage.xlsx'
-        else:
-            output_path = os.path.join(os.path.dirname(first), 'Data Lineage Report.xlsx')
+        output_path = os.path.join(os.path.dirname(first), 'Data Lineage Workbook.xlsx')
     output_path = os.path.abspath(output_path)
 
     # ---- build all lineage trees ----
@@ -644,7 +755,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     if unformatted:
         return [_export_unformatted(reports, output_path)]
 
-    renderer = ClientExcelRenderer(fmt, source_labels, source_fallback)
+    renderer = ClientExcelRenderer(fmt, source_labels, source_fallback, source_match_case)
     written = []
 
     wb = openpyxl.Workbook()
@@ -828,8 +939,9 @@ def load_config(path: str):
     if 'source_labels' in cfg:
         SOURCE_LABELS.clear()
         SOURCE_LABELS.update(cfg['source_labels'])
-    global SOURCE_LABEL_FALLBACK
+    global SOURCE_LABEL_FALLBACK, SOURCE_LABEL_MATCH_CASE
     SOURCE_LABEL_FALLBACK = cfg.get('source_label_fallback', SOURCE_LABEL_FALLBACK)
+    SOURCE_LABEL_MATCH_CASE = cfg.get('source_label_match_case', SOURCE_LABEL_MATCH_CASE)
     log.info("Loaded config overrides from %s", path)
 
 

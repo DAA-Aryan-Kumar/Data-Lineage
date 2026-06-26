@@ -86,15 +86,24 @@ Defaults live at the top of `data_lineage.py`; anything can be overridden
 per-run with `--config file.json` (the GUI's `lineage_settings.json` uses the
 same schema):
 
-* **`TRIVIAL_RULES`** — stop expanding "trivial" objects in Summary sheets:
-  blocked namespaces (`DB`, `DB.SCHEMA` or `DB.SCHEMA.OBJECT`), and
-  level-limits for listed tables/views (`"ALL"` = blanket).
-  `apply_rules_to_detailed` extends the rules to Detailed sheets.
+* **`TRIVIAL_RULES`** — trim noise. Every list holds **glob patterns** matched
+  against an object's `DATABASE.SCHEMA.OBJECT` triple; `*` matches within a
+  segment and entries with fewer than three segments auto-pad with `.*`
+  (`TEMP_DB` → `TEMP_DB.*.*`, `DB.SCHEMA` → `DB.SCHEMA.*`), so `*.DATAWAREHOUSE.*`,
+  `PROD_*.*.BRANCH*` all work; `*.*.*` matches everything (logged). Matching is
+  case-insensitive unless the section's `*_match_case` flag is set (Snowflake
+  quoted identifiers are case-sensitive). The four sections are:
+  `exclude_patterns` (hidden from output, not expanded), `block_patterns`
+  (shown but not expanded), and `table_patterns` / `view_patterns` (shown but
+  not expanded once *beyond* `table_level` / `view_level`). `apply_to_summary`
+  and `apply_to_detailed` choose which sheet set the rules touch.
 * **`EXCEL_FORMAT`** — colors, font, borders, padding, query-block merging,
   hyperlinks, optional freeze panes.
-* **`SOURCE_LABELS`** — prefix → label map for the "List of sources" column
-  (e.g. `PROD_DATALAKE.CRM_MSCRM` → `CRM`); `SOURCE_LABEL_FALLBACK` picks
-  what to show when nothing matches (`schema`, `db` or `blank`).
+* **`SOURCE_LABELS`** — `glob pattern` → label map for the "List of sources"
+  column, using the same glob syntax as the rules (e.g.
+  `*.CRM_MSCRM.*` → `CRM`); the **first matching pattern wins**, so ordering
+  sets priority. `SOURCE_LABEL_FALLBACK` picks what to show when nothing matches
+  (`schema`, `db` or `blank`); `SOURCE_LABEL_MATCH_CASE` toggles case-sensitivity.
 * **Watermark** — a small muted mark in the GUI's top-right corner, **off by
   default**. Turn it on (without forking the code) via any of, in priority
   order: the `LINEAGE_WATERMARK` environment variable, a `watermark.txt`
