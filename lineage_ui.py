@@ -89,6 +89,14 @@ class LineageApp:
                 "Accordion.DataLineageBuilder")
         except Exception:
             pass
+        # Base icon from the .ico (reliable on the existing root); then override
+        # with crisp per-size PNGs via iconphoto when they're available.
+        try:
+            ico = os.path.join(base, 'app.ico')
+            if os.path.exists(ico):
+                self.root.iconbitmap(ico)
+        except Exception:
+            pass
         try:
             imgs = []
             for size in (256, 128, 64, 48, 32, 24, 16):
@@ -98,12 +106,6 @@ class LineageApp:
             if imgs:
                 self._icon_imgs = imgs   # keep refs alive
                 self.root.iconphoto(True, *imgs)
-        except Exception:
-            pass
-        try:
-            ico = os.path.join(base, 'app.ico')
-            if os.path.exists(ico):
-                self.root.iconbitmap(default=ico)
         except Exception:
             pass
 
