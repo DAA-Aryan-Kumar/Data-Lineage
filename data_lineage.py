@@ -887,25 +887,41 @@ def _render_report_task(task: dict) -> dict:
     }
 
 
-def _run_report_tasks(tasks: list[dict], workers: int, report_progress) -> list[dict]:
+def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
+                      errors: list | None = None) -> list[dict]:
     """Render all report tasks, sequentially (workers<=1) or across a process
-    pool. Per-report progress is logged as each one finishes."""
+    pool. Per-report progress is logged as each one finishes. A task that fails
+    (e.g. a malformed input file) is logged and skipped (its slot stays None)
+    so the other reports still build; the failure is recorded in `errors`."""
     n = len(tasks)
     results: list = [None] * n
+
+    def _failed(task, exc, done):
+        log.error("Skipping %s: %s", task['name'], exc)
+        report_progress(f"  [{done}/{n}] ! skipped {task['name']}: {exc}")
+        if errors is not None:
+            errors.append((task['name'], str(exc)))
+
     if workers <= 1:
         for i, task in enumerate(tasks):
-            results[i] = _render_report_task(task)
-            report_progress(f"  [{i + 1}/{n}] rendered {results[i]['report_name']}")
+            try:
+                results[i] = _render_report_task(task)
+                report_progress(f"  [{i + 1}/{n}] rendered {results[i]['report_name']}")
+            except Exception as exc:
+                _failed(task, exc, i + 1)
         return results
     from concurrent.futures import ProcessPoolExecutor, as_completed
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_render_report_task, t): i for i, t in enumerate(tasks)}
+        futs = {pool.submit(_render_report_task, t): (i, t) for i, t in enumerate(tasks)}
         done = 0
         for fut in as_completed(futs):
-            i = futs[fut]
-            results[i] = fut.result()
+            i, task = futs[fut]
             done += 1
-            report_progress(f"  [{done}/{n}] rendered {results[i]['report_name']}")
+            try:
+                results[i] = fut.result()
+                report_progress(f"  [{done}/{n}] rendered {results[i]['report_name']}")
+            except Exception as exc:
+                _failed(task, exc, done)
     return results
 
 
@@ -922,7 +938,7 @@ def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallba
         s_sheet = ClientExcelRenderer.safe_sheet_name(name, taken)
         d_sheet = (ClientExcelRenderer.safe_sheet_name(name, taken, suffix=' (Detailed)')
                    if include_detailed else None)
-        tasks.append({'path': path, 'rules': eff_rules, 'fmt': fmt,
+        tasks.append({'path': path, 'name': name, 'rules': eff_rules, 'fmt': fmt,
                       'source_labels': source_labels, 'source_fallback': source_fallback,
                       'include_detailed': include_detailed, 'include_source': include_source,
                       'seed': seed, 'drop_summary': drop_s, 'drop_detailed': drop_d,
@@ -931,7 +947,8 @@ def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallba
 
 
 def _build_separate_files(input_files, output_path, eff_rules, fmt, source_labels,
-                          source_fallback, include_detailed, max_workers, report_progress):
+                          source_fallback, include_detailed, max_workers, report_progress,
+                          errors=None):
     """One standalone workbook per report (Summary + Detailed + Source Tables),
     rendered in parallel. No index sheet (it's meaningless for single files)."""
     out_dir = os.path.dirname(output_path)
@@ -941,7 +958,7 @@ def _build_separate_files(input_files, output_path, eff_rules, fmt, source_label
         taken = set()
         out_paths = []
         for path in input_files:
-            base = re.sub(r"[\\/:*?\"<>|]", ' ', derive_report_name(path)).strip() or 'report'
+            base = re.sub(r"[\\/:*?\"<>|]", ' ', peek_report_name(path)).strip() or 'report'
             cand, n = base, 2
             while cand.lower() in taken:
                 cand = f'{base} ({n})'
@@ -953,7 +970,7 @@ def _build_separate_files(input_files, output_path, eff_rules, fmt, source_label
     workers = _resolve_workers(max_workers, len(tasks))
     report_progress(f"Rendering {len(tasks)} report(s) to separate files "
                     f"with {workers} worker process(es)...")
-    results = _run_report_tasks(tasks, workers, report_progress)
+    results = _run_report_tasks(tasks, workers, report_progress, errors)
     return [r['out_path'] for r in results if r]
 
 
@@ -1112,7 +1129,8 @@ def _merge_xlsx(ordered_sheets: list[tuple], template_path: str, output_path: st
 
 
 def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labels,
-                           source_fallback, include_detailed, max_workers, report_progress):
+                           source_fallback, include_detailed, max_workers, report_progress,
+                           errors=None):
     """Render every report to a standalone file in parallel, then splice their
     Summary/Detailed sheets + a combined index + merged Source Tables into one
     workbook by raw XML assembly."""
@@ -1125,7 +1143,9 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
                                    seed=True)
         workers = _resolve_workers(max_workers, len(tasks))
         report_progress(f"Rendering {len(tasks)} report(s) with {workers} worker process(es)...")
-        results = _run_report_tasks(tasks, workers, report_progress)
+        results = [r for r in _run_report_tasks(tasks, workers, report_progress, errors) if r]
+        if not results:
+            return []          # every report failed; build_workbooks reports it
 
         report_progress("Merging into one workbook...")
         aux_path = _build_aux(results, fmt, source_labels, source_fallback, include_detailed)
@@ -1163,9 +1183,14 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
                     source_labels: dict | None = None, source_fallback: str | None = None,
                     include_detailed: bool = True, separate_detailed: bool = False,
                     unformatted: bool = False, combine: bool = True,
-                    max_workers: int | None = None, progress=None) -> list[str]:
+                    max_workers: int | None = None, write_error_log: bool = False,
+                    progress=None) -> list[str]:
     """Process every input file and write the output workbook(s).
     Returns the list of files written. `progress` is an optional callback(str).
+
+    A file that can't be processed (e.g. not a valid impact report) is logged
+    and skipped so the rest still build; if `write_error_log` is set, the
+    skipped files are also written to 'Lineage Errors.txt' in the output folder.
 
     Whether root queries with no upstream lineage are dropped is read per sheet
     set from rules['drop_no_lineage_summary'/'_detailed']."""
@@ -1174,11 +1199,25 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     eff_rules = TRIVIAL_RULES if rules is None else rules
     drop_summary = eff_rules.get('drop_no_lineage_summary', True)
     drop_detailed = eff_rules.get('drop_no_lineage_detailed', True)
+    errors: list = []           # (report-name, message) for files that were skipped
 
     def report_progress(msg):
         log.info(msg)
         if progress:
             progress(msg)
+
+    def _finish(written):
+        """Common tail: report/write skipped-file errors, then return the
+        written paths (or raise if nothing could be built at all)."""
+        if errors:
+            report_progress(f"  {len(errors)} of {len(input_files)} report(s) "
+                            f"could not be processed and were skipped.")
+            if write_error_log:
+                _write_error_report(errors, output_path, report_progress)
+        if not written:
+            raise ValueError(f"None of the {len(input_files)} input file(s) could be "
+                             f"processed. See the log for details.")
+        return written
 
     if not input_files:
         raise ValueError("No input files provided.")
@@ -1198,10 +1237,10 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     if not combine and not unformatted:
         written = _build_separate_files(input_files, output_path, eff_rules, fmt,
                                         source_labels, source_fallback, include_detailed,
-                                        max_workers, report_progress)
+                                        max_workers, report_progress, errors)
         for path in written:
             report_progress(f"Saved {path}")
-        return written
+        return _finish(written)
 
     # ---- combined workbook, parallel render + cheap XML merge ----
     # (the serial path below still handles separate_detailed and the 1-worker
@@ -1209,28 +1248,37 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     if (combine and not unformatted and not separate_detailed
             and _resolve_workers(max_workers, len(input_files)) > 1):
         try:
-            return _build_combined_merged(input_files, output_path, eff_rules, fmt,
-                                          source_labels, source_fallback, include_detailed,
-                                          max_workers, report_progress)
+            return _finish(_build_combined_merged(
+                input_files, output_path, eff_rules, fmt, source_labels, source_fallback,
+                include_detailed, max_workers, report_progress, errors))
         except _StyleMergeMismatch as exc:
             report_progress(f"  Style tables diverged for '{exc}' - falling back to a "
                             f"serial combine to keep formatting correct.")
+            errors.clear()      # the serial path re-processes everything below
             # fall through to the serial combined path below
 
     # ---- build all lineage trees (serial: combined / unformatted) ----
     reports = []
     for path in input_files:
-        builder = DataLineageBuilder(path, rules=rules).load()
-        report_progress(f"Tracing lineage: {builder.report_name}")
-        summary_roots, expanded_at = builder.build_tree(
-            summarize=True, drop_no_lineage=drop_summary)
-        detailed = (builder.build_tree(summarize=False, drop_no_lineage=drop_detailed)
-                    if include_detailed else (None, None))
-        reports.append({'builder': builder, 'summary': (summary_roots, expanded_at),
-                        'detailed': detailed})
+        try:
+            builder = DataLineageBuilder(path, rules=rules).load()
+            report_progress(f"Tracing lineage: {builder.report_name}")
+            summary_roots, expanded_at = builder.build_tree(
+                summarize=True, drop_no_lineage=drop_summary)
+            detailed = (builder.build_tree(summarize=False, drop_no_lineage=drop_detailed)
+                        if include_detailed else (None, None))
+            reports.append({'builder': builder, 'summary': (summary_roots, expanded_at),
+                            'detailed': detailed})
+        except Exception as exc:
+            label = derive_report_name(path)
+            log.error("Skipping %s: %s", label, exc)
+            errors.append((label, str(exc)))
 
     if unformatted:
-        return [_export_unformatted(reports, output_path)]
+        return _finish([_export_unformatted(reports, output_path)] if reports else [])
+
+    if not reports:
+        return _finish([])      # every input failed -> nothing to write
 
     renderer = ClientExcelRenderer(fmt, source_labels, source_fallback)
     written = []
@@ -1293,7 +1341,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         written.append(_safe_save(detail_wb, detail_path))
     for path in written:
         report_progress(f"Saved {path}")
-    return written
+    return _finish(written)
 
 
 _SOURCE_HEADER = ['db', 'schema', 'object', 'type', 'List of sources',
@@ -1427,6 +1475,23 @@ def _path_to(root: Node, leaf: Node) -> list[Node]:
     return path
 
 
+def _write_error_report(errors: list, output_path: str, report_progress) -> str | None:
+    """Write the skipped-file errors to 'Lineage Errors.txt' in the output
+    folder, one section per report/object. Off by default (opt-in)."""
+    path = os.path.join(os.path.dirname(output_path) or '.', 'Lineage Errors.txt')
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write("Reports that could not be processed\n")
+            fh.write("=" * 38 + "\n\n")
+            for name, msg in errors:
+                fh.write(f"## {name}\n{msg}\n\n")
+        report_progress(f"Wrote error report: {path}")
+        return path
+    except OSError as exc:
+        report_progress(f"  Could not write error report: {exc}")
+        return None
+
+
 def _safe_save(wb, path: str) -> str:
     """Save the workbook; fall back to a numbered name if the file is locked by Excel."""
     try:
@@ -1483,6 +1548,8 @@ def main(argv=None):
                         help="Write one workbook per report instead of merging into one")
     parser.add_argument('--workers', type=int, default=None,
                         help="Number of worker processes for rendering (default: CPUs-1)")
+    parser.add_argument('--error-log', action='store_true',
+                        help="Write skipped files to 'Lineage Errors.txt' in the output folder")
     parser.add_argument('--drop-no-lineage', action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Ignore root queries that have no upstream lineage "
@@ -1520,7 +1587,8 @@ def main(argv=None):
                                   separate_detailed=args.separate,
                                   unformatted=args.unformatted,
                                   combine=not args.no_combine,
-                                  max_workers=args.workers)
+                                  max_workers=args.workers,
+                                  write_error_log=args.error_log)
     except Exception as exc:
         log.error("Failed to process lineage: %s", exc)
         sys.exit(1)

@@ -365,11 +365,17 @@ class LineageApp:
 
         log_frame = ttk.LabelFrame(tab, text="Log", padding=4)
         log_frame.pack(fill='both', expand=True)
-        self.log_text = tk.Text(log_frame, height=10, state='disabled',
+        self.opt_error_log = tk.BooleanVar(value=False)
+        ttk.Checkbutton(log_frame, variable=self.opt_error_log,
+                        text="Write an error report (.txt) listing any files that were skipped"
+                        ).pack(anchor='w', padx=2, pady=(0, 2))
+        log_body = ttk.Frame(log_frame)
+        log_body.pack(fill='both', expand=True)
+        self.log_text = tk.Text(log_body, height=10, state='disabled',
                                 font=('Consolas', 9), background='#FAF7FC')
         self._register_themed(self.log_text, light_bg='#FAF7FC')
         self.log_text.pack(side='left', fill='both', expand=True)
-        log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        log_scroll = ttk.Scrollbar(log_body, command=self.log_text.yview)
         log_scroll.pack(side='left', fill='y')
         self.log_text.config(yscrollcommand=log_scroll.set)
 
@@ -634,6 +640,7 @@ class LineageApp:
             unformatted=self.opt_unformatted.get(),
             combine=self.opt_combine.get(),
             max_workers=self.worker_count.get(),
+            write_error_log=self.opt_error_log.get(),
         )
         self.worker = threading.Thread(target=self._worker_main, args=(kwargs,), daemon=True)
         self.worker.start()
@@ -729,6 +736,7 @@ class LineageApp:
                 'unformatted': self.opt_unformatted.get(),
                 'combine': self.opt_combine.get(),
                 'workers': self.worker_count.get(),
+                'error_log': self.opt_error_log.get(),
                 'dark': self.dark.get(),
             },
         }
@@ -784,6 +792,7 @@ class LineageApp:
         self.opt_unformatted.set(ui.get('unformatted', False))
         self.opt_combine.set(ui.get('combine', True))
         self.worker_count.set(ui.get('workers', max(1, (os.cpu_count() or 2) - 1)))
+        self.opt_error_log.set(ui.get('error_log', False))
         self.dark.set(ui.get('dark', False))
 
 
