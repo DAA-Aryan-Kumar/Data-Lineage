@@ -47,6 +47,16 @@ ACCENT = '#7030A0'        # client purple
 ACCENT_LIGHT = '#F2CEEF'  # client pink
 
 
+def _safe_config(widget, **opts):
+    """Apply widget options one at a time, skipping any the widget rejects
+    (e.g. a Listbox has no 'insertbackground')."""
+    for key, val in opts.items():
+        try:
+            widget.configure(**{key: val})
+        except tk.TclError:
+            pass
+
+
 class QueueLogHandler(logging.Handler):
     """Routes engine log records into the UI thread via a queue."""
 
@@ -70,11 +80,20 @@ class LineageApp:
         self.worker: threading.Thread | None = None
         self.written_files: list[str] = []
         self._files: list[str] = []   # input report paths, in processing order
+        self.dark = tk.BooleanVar(value=False)
+        self._themed = []   # (tk widget, light_bg, light_fg) recoloured on theme switch
+        self._watermark_lbl = None
 
-        self._build_styles()
+        self._apply_theme()
         self._build_layout()
         self._load_settings()
+        self._apply_theme()   # re-apply now that widgets exist (honours saved dark)
         self._poll_log_queue()
+
+    def _register_themed(self, widget, light_bg='#ffffff', light_fg='#000000'):
+        """Track a classic-tk widget so dark mode can recolour it."""
+        self._themed.append((widget, light_bg, light_fg))
+        return widget
 
     def _set_window_icon(self):
         """Give the title bar and taskbar a crisp icon at any DPI. Prefer
@@ -110,17 +129,66 @@ class LineageApp:
             pass
 
     # ------------------------------------------------------------------ UI --
-    def _build_styles(self):
+    def _apply_theme(self, *_):
+        """Apply light (native 'vista') or dark ('clam' + palette) theme.
+        Light is the original look, untouched; dark recolours ttk styles, the
+        root, and the registered classic-tk widgets."""
         style = ttk.Style(self.root)
+        dark = self.dark.get()
+        if not dark:
+            try:
+                style.theme_use('vista')
+            except tk.TclError:
+                pass
+            style.configure('Title.TLabel', font=('Segoe UI', 16, 'bold'), foreground=ACCENT)
+            style.configure('Sub.TLabel', font=('Segoe UI', 9), foreground='#666666')
+            style.configure('Run.TButton', font=('Segoe UI', 11, 'bold'))
+            style.configure('TNotebook.Tab', font=('Segoe UI', 10), padding=(14, 6))
+            try:
+                self.root.configure(background='SystemButtonFace')
+            except tk.TclError:
+                pass
+            for w, lbg, lfg in self._themed:
+                _safe_config(w, bg=lbg, fg=lfg, insertbackground=lfg,
+                             selectbackground='#cce8ff', selectforeground='#000000',
+                             highlightbackground='SystemButtonFace')
+            if self._watermark_lbl:
+                self._watermark_lbl.configure(background='SystemButtonFace', foreground='#C2C2C2')
+            return
+
+        BG, FG, FIELD, SUB, SEL = '#2b2b2b', '#e6e6e6', '#3c3f41', '#9aa0a6', '#365880'
+        style.theme_use('clam')
+        style.configure('.', background=BG, foreground=FG, fieldbackground=FIELD,
+                        bordercolor='#555555', lightcolor=BG, darkcolor=BG,
+                        troughcolor=FIELD, arrowcolor=FG, insertcolor=FG)
+        for cls in ('TFrame', 'TLabel', 'TLabelframe', 'TLabelframe.Label', 'TCheckbutton'):
+            style.configure(cls, background=BG, foreground=FG)
+        style.map('TCheckbutton', background=[('active', BG)])
+        style.configure('TButton', background='#3c3f41', foreground=FG)
+        style.map('TButton', background=[('active', '#4a4d4f'), ('pressed', '#4a4d4f')])
+        style.configure('TEntry', fieldbackground=FIELD, foreground=FG)
+        style.configure('TSpinbox', fieldbackground=FIELD, foreground=FG, arrowcolor=FG)
+        style.configure('TCombobox', fieldbackground=FIELD, foreground=FG, arrowcolor=FG)
+        style.map('TCombobox', fieldbackground=[('readonly', FIELD)], foreground=[('readonly', FG)])
+        style.configure('TNotebook', background=BG, bordercolor='#555555')
+        style.configure('TNotebook.Tab', background='#3c3f41', foreground=FG,
+                        font=('Segoe UI', 10), padding=(14, 6))
+        style.map('TNotebook.Tab', background=[('selected', BG)], foreground=[('selected', FG)])
+        style.configure('Horizontal.TProgressbar', background=ACCENT, troughcolor=FIELD)
+        style.configure('Title.TLabel', background=BG, foreground='#C9A6E8',
+                        font=('Segoe UI', 16, 'bold'))
+        style.configure('Sub.TLabel', background=BG, foreground=SUB, font=('Segoe UI', 9))
+        style.configure('Run.TButton', font=('Segoe UI', 11, 'bold'))
         try:
-            style.theme_use('vista')
+            self.root.configure(background=BG)
         except tk.TclError:
             pass
-        style.configure('Title.TLabel', font=('Segoe UI', 16, 'bold'),
-                        foreground=ACCENT)
-        style.configure('Sub.TLabel', font=('Segoe UI', 9), foreground='#666666')
-        style.configure('Run.TButton', font=('Segoe UI', 11, 'bold'))
-        style.configure('TNotebook.Tab', font=('Segoe UI', 10), padding=(14, 6))
+        for w, lbg, lfg in self._themed:
+            _safe_config(w, bg=FIELD, fg=FG, insertbackground=FG,
+                         selectbackground=SEL, selectforeground='#ffffff',
+                         highlightbackground=BG)
+        if self._watermark_lbl:
+            self._watermark_lbl.configure(background=BG, foreground='#5e5e5e')
 
     def _build_layout(self):
         header = ttk.Frame(self.root, padding=(16, 12, 16, 4))
@@ -186,19 +254,27 @@ class LineageApp:
                         foreground='#C2C2C2', background=self.root.cget('background'))
         mark.place(relx=1.0, rely=0.0, x=-10, y=6, anchor='ne')
         mark.lift()
+        self._watermark_lbl = mark
+        self._apply_theme()   # match its colours to the current theme
 
     # ---- tab 1: run ----------------------------------------------------------
     def _build_run_tab(self):
         tab = ttk.Frame(self.notebook, padding=12)
         self.notebook.add(tab, text='  Run  ')
 
+        topbar = ttk.Frame(tab)
+        topbar.pack(fill='x')
+        ttk.Checkbutton(topbar, text="🌙 Dark mode", variable=self.dark,
+                        command=self._apply_theme).pack(side='right')
+
         files_frame = ttk.LabelFrame(tab, text="Atlan impact reports (.csv / .xlsx)",
                                      padding=8)
-        files_frame.pack(fill='x')
+        files_frame.pack(fill='x', pady=(4, 0))
         list_row = ttk.Frame(files_frame)
         list_row.pack(fill='x')
         self.files_list = tk.Listbox(list_row, height=5, selectmode='extended',
                                      activestyle='dotbox')
+        self._register_themed(self.files_list)
         self.files_list.pack(side='left', fill='both', expand=True)
         scroll = ttk.Scrollbar(list_row, command=self.files_list.yview)
         scroll.pack(side='left', fill='y')
@@ -244,6 +320,7 @@ class LineageApp:
         log_frame.pack(fill='both', expand=True)
         self.log_text = tk.Text(log_frame, height=10, state='disabled',
                                 font=('Consolas', 9), background='#FAF7FC')
+        self._register_themed(self.log_text, light_bg='#FAF7FC')
         self.log_text.pack(side='left', fill='both', expand=True)
         log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         log_scroll.pack(side='left', fill='y')
@@ -274,7 +351,7 @@ class LineageApp:
             ttk.Checkbutton(toggles, text="Detailed", variable=dv).grid(
                 row=r, column=2, sticky='w')
 
-        ttk.Label(
+        help_lbl = ttk.Label(
             tab,
             text="Each box takes one glob pattern per line, matched against "
                  "DATABASE.SCHEMA.OBJECT (e.g.  *.DATAWAREHOUSE.*,  PROD_*.*.BRANCH*,  "
@@ -282,7 +359,11 @@ class LineageApp:
                  "(TEMP_DB = TEMP_DB.*.*). Matching ignores case unless you quote "
                  'the entry, e.g.  "PROD_DATALAKE.LAWPROD.attrep_changes*"  '
                  "(for case-sensitive Snowflake quoted identifiers).",
-            style='Sub.TLabel', wraplength=920, justify='left').pack(anchor='w', pady=(0, 8))
+            style='Sub.TLabel', justify='left')
+        help_lbl.pack(anchor='w', fill='x', pady=(0, 8))
+        # Wrap to the actual available width so the text never clips at min width.
+        tab.bind('<Configure>',
+                 lambda e: help_lbl.configure(wraplength=max(280, e.width - 24)))
 
         grid = ttk.Frame(tab)
         grid.pack(fill='both', expand=True)
@@ -305,6 +386,7 @@ class LineageApp:
                 ttk.Spinbox(row, from_=0, to=99, width=4,
                             textvariable=level_var).pack(side='left', padx=4)
             txt = tk.Text(f, height=6, font=('Consolas', 9))
+            self._register_themed(txt)
             txt.pack(fill='both', expand=True, pady=(4, 0))
             return txt
 
@@ -373,6 +455,7 @@ class LineageApp:
             padding=8)
         src.pack(fill='both', expand=True, pady=(10, 0))
         self.src_text = tk.Text(src, height=8, font=('Consolas', 9))
+        self._register_themed(self.src_text)
         self.src_text.pack(fill='both', expand=True)
         fb_row = ttk.Frame(src)
         fb_row.pack(anchor='w', pady=(6, 0))
@@ -568,6 +651,7 @@ class LineageApp:
                 'include_detailed': self.opt_detailed.get(),
                 'separate_detailed': self.opt_separate.get(),
                 'unformatted': self.opt_unformatted.get(),
+                'dark': self.dark.get(),
             },
         }
         try:
@@ -620,6 +704,7 @@ class LineageApp:
         self.opt_detailed.set(ui.get('include_detailed', True))
         self.opt_separate.set(ui.get('separate_detailed', False))
         self.opt_unformatted.set(ui.get('unformatted', False))
+        self.dark.set(ui.get('dark', False))
 
 
 def run():
