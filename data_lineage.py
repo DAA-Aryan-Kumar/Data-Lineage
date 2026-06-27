@@ -943,7 +943,7 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
 
     def _failed(task, exc, done):
         if stop_on_error:
-            raise exc
+            raise RuntimeError(f"{task['name']}: {exc}") from exc
         log.error("Skipping %s: %s", task['name'], exc)
         report_progress(f"  [{done}/{n}] ! skipped {task['name']}: {exc}")
         if errors is not None:
@@ -977,13 +977,13 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
         return results
 
     from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
-    # Recycle each worker after one report so its peak memory is returned to the
-    # OS between reports (the big win for the 8-9 GB balloon); max_tasks_per_child
-    # is Python 3.11+, so fall back gracefully on older interpreters.
-    pool_kw = {'max_workers': workers}
-    if sys.version_info >= (3, 11):
-        pool_kw['max_tasks_per_child'] = 1
-    pool = ProcessPoolExecutor(**pool_kw)
+    # Workers are REUSED across reports. We deliberately do NOT set
+    # max_tasks_per_child: in the one-file .exe each new worker re-extracts the
+    # ~38 MB bundle, so recycling per report made startup dominate the run when
+    # the worker cap was below the report count. Memory is instead kept in check
+    # by _render_report_task dropping its heavy objects + gc.collect() after each
+    # report, so a reused worker doesn't accumulate across its tasks.
+    pool = ProcessPoolExecutor(max_workers=workers)
     futs = {}
     try:
         futs = {pool.submit(_render_report_task, t): (i, t) for i, t in enumerate(tasks)}
@@ -1406,7 +1406,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
                             'detailed': detailed})
         except Exception as exc:
             if stop_on_error:
-                raise
+                raise RuntimeError(f"{derive_report_name(path)}: {exc}") from exc
             label = derive_report_name(path)
             log.error("Skipping %s: %s", label, exc)
             errors.append((label, str(exc)))
