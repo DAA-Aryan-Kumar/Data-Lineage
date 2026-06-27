@@ -630,13 +630,13 @@ class ClientExcelRenderer:
             if len(words) > 1:                            # a single token (e.g. a snowflake
                 candidate = ' '.join(w[:4] for w in words)  # table VW_...) keeps its prefix
         if len(candidate) > budget:                       # 3. last-resort truncate
-            candidate = candidate[:budget].rstrip()
+            candidate = candidate[:budget].rstrip(' _-')
 
         candidate = (candidate + suffix).strip()
         base, n = candidate, 2
         while candidate.lower() in taken:                 # 4. ensure uniqueness
             tail = f' ({n})'
-            candidate = base[:31 - len(tail)].rstrip() + tail
+            candidate = base[:31 - len(tail)].rstrip(' _-') + tail
             n += 1
         taken.add(candidate.lower())
         return candidate
@@ -944,8 +944,9 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
     def _failed(task, exc, done):
         if stop_on_error:
             raise RuntimeError(f"{task['name']}: {exc}") from exc
-        log.error("Skipping %s: %s", task['name'], exc)
-        report_progress(f"  [{done}/{n}] ! skipped {task['name']}: {exc}")
+        # one consistently-indented warning line (was a 0-indent error + a
+        # duplicate 2-indent line); WARNING so the GUI colours it
+        log.warning("  [%d/%d] skipped %s: %s", done, n, task['name'], exc)
         if errors is not None:
             errors.append((task['name'], str(exc)))
 
@@ -977,13 +978,14 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
         return results
 
     from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
-    # Workers are REUSED across reports. We deliberately do NOT set
-    # max_tasks_per_child: in the one-file .exe each new worker re-extracts the
-    # ~38 MB bundle, so recycling per report made startup dominate the run when
-    # the worker cap was below the report count. Memory is instead kept in check
-    # by _render_report_task dropping its heavy objects + gc.collect() after each
-    # report, so a reused worker doesn't accumulate across its tasks.
-    pool = ProcessPoolExecutor(max_workers=workers)
+    # Recycle each worker after one report (max_tasks_per_child=1, Python 3.11+)
+    # so its peak memory is returned to the OS immediately rather than the worker
+    # sitting at its high-water mark until the whole batch finishes. The one-file
+    # bundle re-extraction this implies is fast, so it's a good trade.
+    pool_kw = {'max_workers': workers}
+    if sys.version_info >= (3, 11):
+        pool_kw['max_tasks_per_child'] = 1
+    pool = ProcessPoolExecutor(**pool_kw)
     futs = {}
     try:
         futs = {pool.submit(_render_report_task, t): (i, t) for i, t in enumerate(tasks)}
@@ -1014,18 +1016,29 @@ def _run_report_tasks(tasks: list[dict], workers: int, report_progress,
 
 
 def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
-                       include_detailed, include_source, out_paths, seed=False) -> list[dict]:
-    """Build per-report task dicts with globally-unique sheet names so the
-    rendered sheets never collide when merged and internal hyperlinks stay valid."""
+                       include_detailed, include_source, out_paths, seed=False,
+                       defer_naming=False) -> list[dict]:
+    """Build per-report task dicts.
+
+    defer_naming=True (the merge path): do NOT read files here -- the workers do
+    all the loading in parallel. Each report renders under fixed 'Summary' /
+    'Detailed' sheet names and the parent assigns the final, unique, data-driven
+    sheet names at splice time. defer_naming=False (separate-files): peek each
+    file so its output is named after its report and sheet names are unique."""
     drop_s = eff_rules.get('drop_no_lineage_summary', True)
     drop_d = eff_rules.get('drop_no_lineage_detailed', True)
     taken = {'list of reports', 'source tables'}
     tasks = []
     for path, out_path in zip(input_files, out_paths):
-        name = peek_report_name(path)   # data-driven, matches the child's name
-        s_sheet = ClientExcelRenderer.safe_sheet_name(name, taken)
-        d_sheet = (ClientExcelRenderer.safe_sheet_name(name, taken, suffix=' (Detailed)')
-                   if include_detailed else None)
+        if defer_naming:
+            name = derive_report_name(path)      # label for errors only (no file read)
+            s_sheet = 'Summary'
+            d_sheet = 'Detailed' if include_detailed else None
+        else:
+            name = peek_report_name(path)        # data-driven, matches the child's name
+            s_sheet = ClientExcelRenderer.safe_sheet_name(name, taken)
+            d_sheet = (ClientExcelRenderer.safe_sheet_name(name, taken, suffix=' (Detailed)')
+                       if include_detailed else None)
         tasks.append({'path': path, 'name': name, 'rules': eff_rules, 'fmt': fmt,
                       'source_labels': source_labels, 'source_fallback': source_fallback,
                       'include_detailed': include_detailed, 'include_source': include_source,
@@ -1036,10 +1049,12 @@ def _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallba
 
 def _build_separate_files(input_files, output_path, eff_rules, fmt, source_labels,
                           source_fallback, include_detailed, max_workers, report_progress,
-                          errors=None, stop_on_error=False, cancel=None):
+                          errors=None, stop_on_error=False, cancel=None, avoid_overwrite=False):
     """One standalone workbook per report (Summary + Detailed + Source Tables),
     rendered in parallel. No index sheet (it's meaningless for single files)."""
     out_paths = _separate_out_paths(input_files, output_path)
+    if avoid_overwrite:
+        out_paths = [_avoid_existing(p) for p in out_paths]
     tasks = _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
                                include_detailed, include_source=True, out_paths=out_paths)
     workers = _resolve_workers(max_workers, len(tasks))
@@ -1086,6 +1101,16 @@ def _sheet_xml_by_name(zf: zipfile.ZipFile, name: str) -> bytes:
     if not target.startswith('xl/'):
         target = 'xl/' + target
     return zf.read(target)
+
+
+def _rename_summary_refs(xml: bytes, new_name: str) -> bytes:
+    """A merge-path worker renders its summary sheet under the fixed name
+    'Summary', so its intra-sheet dup->expansion hyperlinks point at
+    location="'Summary'!...". Rewrite those to the final sheet name so the links
+    stay valid once the sheet is renamed in the merged workbook. (The detailed
+    sheet has link_dups=False, so it has no such refs.)"""
+    new = ("location=\"'%s'!" % _xml_escape(new_name)).encode('utf-8')
+    return xml.replace(b"location=\"'Summary'!", new)
 
 
 def _safe_replace(tmp_path: str, target: str) -> str:
@@ -1215,7 +1240,7 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
         out_paths = [os.path.join(tmpdir, f'r{i}.xlsx') for i in range(len(input_files))]
         tasks = _make_report_tasks(input_files, eff_rules, fmt, source_labels, source_fallback,
                                    include_detailed, include_source=False, out_paths=out_paths,
-                                   seed=True)
+                                   seed=True, defer_naming=True)
         workers = _resolve_workers(max_workers, len(tasks))
         report_progress(f"Rendering {len(tasks)} report(s) with {workers} worker process(es)...")
         results = [r for r in _run_report_tasks(tasks, workers, report_progress,
@@ -1224,6 +1249,14 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
             return []          # every report failed; build_workbooks reports it
 
         report_progress("Merging into one workbook...")
+        # Workers rendered under fixed 'Summary'/'Detailed' names; assign the
+        # final, unique, data-driven sheet names now (data-driven names were
+        # computed in the workers and returned as report_name).
+        taken = {'list of reports', 'source tables'}
+        for res in results:
+            res['summary_sheet'] = ClientExcelRenderer.safe_sheet_name(res['report_name'], taken)
+            res['detailed_sheet'] = (ClientExcelRenderer.safe_sheet_name(
+                res['report_name'], taken, suffix=' (Detailed)') if include_detailed else None)
         aux_path = _build_aux(results, fmt, source_labels, source_fallback, include_detailed)
         ordered = []
         with zipfile.ZipFile(aux_path) as az:
@@ -1236,11 +1269,12 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
                     # guarantees this). Refuse to emit a mis-styled workbook.
                     if rz.read('xl/styles.xml') != aux_styles:
                         raise _StyleMergeMismatch(res['report_name'])
-                    ordered.append((res['summary_sheet'],
-                                    _sheet_xml_by_name(rz, res['summary_sheet'])))
-                    if include_detailed and res['detailed_sheet']:
+                    summary = _rename_summary_refs(_sheet_xml_by_name(rz, 'Summary'),
+                                                   res['summary_sheet'])
+                    ordered.append((res['summary_sheet'], summary))
+                    if res['detailed_sheet']:
                         ordered.append((res['detailed_sheet'],
-                                        _sheet_xml_by_name(rz, res['detailed_sheet'])))
+                                        _sheet_xml_by_name(rz, 'Detailed')))
             ordered.append(('Source Tables', _sheet_xml_by_name(az, 'Source Tables')))
         final = _merge_xlsx(ordered, aux_path, output_path)
         report_progress(f"Saved {final}")
@@ -1254,6 +1288,19 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
 # ===========================================================================
 # WORKBOOK ASSEMBLY
 # ===========================================================================
+def _avoid_existing(path: str) -> str:
+    """Return `path`, or the first 'name (N).ext' that doesn't exist yet, so an
+    existing output is kept instead of overwritten (opt-in)."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    for n in range(2, 1000):
+        alt = f'{base} ({n}){ext}'
+        if not os.path.exists(alt):
+            return alt
+    return path
+
+
 def _dedup_inputs(input_files: list[str]) -> list[str]:
     """Drop duplicate input paths (normalised), keeping first-occurrence order."""
     seen, out = set(), []
@@ -1317,7 +1364,8 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
                     include_detailed: bool = True, separate_detailed: bool = False,
                     unformatted: bool = False, combine: bool = True,
                     max_workers: int | None = None, write_error_log: bool = False,
-                    stop_on_error: bool = False, cancel=None, progress=None) -> list[str]:
+                    stop_on_error: bool = False, avoid_overwrite: bool = False,
+                    cancel=None, progress=None) -> list[str]:
     """Process every input file and write the output workbook(s).
     Returns the list of files written. `progress` is an optional callback(str).
 
@@ -1364,13 +1412,15 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
     if output_path is None:
         output_path = _default_output_path(input_files)
     output_path = os.path.abspath(output_path)
+    if avoid_overwrite:           # keep an existing file; write a numbered copy
+        output_path = _avoid_existing(output_path)
 
     # ---- one standalone file per report (parallel, no merge) ----
     if not combine and not unformatted:
         written = _build_separate_files(input_files, output_path, eff_rules, fmt,
                                         source_labels, source_fallback, include_detailed,
                                         max_workers, report_progress, errors, stop_on_error,
-                                        cancel)
+                                        cancel, avoid_overwrite)
         for path in written:
             report_progress(f"Saved {path}")
         return _finish(written)
@@ -1408,7 +1458,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
             if stop_on_error:
                 raise RuntimeError(f"{derive_report_name(path)}: {exc}") from exc
             label = derive_report_name(path)
-            log.error("Skipping %s: %s", label, exc)
+            log.warning("  skipped %s: %s", label, exc)
             errors.append((label, str(exc)))
 
     if unformatted:
@@ -1431,6 +1481,8 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
         detail_wb = openpyxl.Workbook()
         detail_wb.remove(detail_wb.active)
         detail_path = re.sub(r'\.xlsx$', '', output_path, flags=re.I) + ' (Detailed).xlsx'
+        if avoid_overwrite:
+            detail_path = _avoid_existing(detail_path)
 
     taken_main, taken_detail = {'list of reports', 'source tables'}, set()
     index_rows = []
@@ -1695,6 +1747,9 @@ def main(argv=None):
                              "(default: skip it and continue)")
     parser.add_argument('-y', '--yes', action='store_true',
                         help="Overwrite existing output files without prompting")
+    parser.add_argument('--no-overwrite', action='store_true',
+                        help="If an output file exists, write a numbered copy instead of "
+                             "overwriting it (skips the prompt)")
     parser.add_argument('--drop-no-lineage', action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Ignore root queries that have no upstream lineage "
@@ -1738,8 +1793,9 @@ def main(argv=None):
     if args.unformatted and args.separate:
         log.warning("--separate ignored: --unformatted writes a single raw workbook.")
 
-    # Confirm before overwriting existing output (skip with --yes).
-    if not args.yes:
+    # Confirm before overwriting existing output (skip with --yes or
+    # --no-overwrite, which writes a numbered copy instead).
+    if not args.yes and not args.no_overwrite:
         existing = [p for p in _planned_outputs(inputs, args.output, not args.no_combine,
                                                 args.unformatted, args.separate)
                     if os.path.exists(p)]
@@ -1763,7 +1819,8 @@ def main(argv=None):
                                   combine=not args.no_combine,
                                   max_workers=args.workers,
                                   write_error_log=args.error_log,
-                                  stop_on_error=args.stop_on_error)
+                                  stop_on_error=args.stop_on_error,
+                                  avoid_overwrite=args.no_overwrite)
     except Exception as exc:
         log.error("Failed to process lineage: %s", exc)
         sys.exit(1)

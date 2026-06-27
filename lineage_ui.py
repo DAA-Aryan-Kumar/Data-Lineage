@@ -431,6 +431,10 @@ class LineageApp:
         # wrap rather than clip at narrow widths
         tab.bind('<Configure>',
                  lambda e: naming_hint.configure(wraplength=max(280, e.width - 24)), add='+')
+        self.opt_avoid_overwrite = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tab, variable=self.opt_avoid_overwrite,
+                        text="If a file already exists, save a numbered copy instead of "
+                             "overwriting it").pack(anchor='w', pady=(4, 0))
 
         self.opt_detailed = tk.BooleanVar(value=True)
         self.opt_combine = tk.BooleanVar(value=True)
@@ -459,7 +463,7 @@ class LineageApp:
         wrow = ttk.Frame(comb)
         wrow.pack(anchor='w', padx=6, pady=2)
         ttk.Label(wrow, text="Worker process cap:").pack(side='left')
-        self.worker_spin = ttk.Spinbox(wrow, from_=1, to=max(1, os.cpu_count() or 8),
+        self.worker_spin = ttk.Spinbox(wrow, from_=1, to=max(64, (os.cpu_count() or 8)),
                                        width=4, textvariable=self.worker_count)
         self.worker_spin.pack(side='left', padx=4)
         self._toggle_workers()
@@ -754,22 +758,25 @@ class LineageApp:
             messagebox.showerror("File not found", "\n".join(missing))
             return
         # confirm before overwriting any existing output (on the UI thread,
-        # before the build starts, so there's no cross-thread dialog)
-        try:
-            planned = engine._planned_outputs(
-                files, self.output_var.get().strip() or None,
-                self.opt_combine.get(), self.opt_unformatted.get(), self.opt_separate.get())
-        except Exception:
-            planned = []
-        existing = [p for p in planned if os.path.exists(p)]
-        if existing:
-            shown = "\n".join("  • " + os.path.basename(p) for p in existing[:12])
-            more = "" if len(existing) <= 12 else f"\n  …and {len(existing) - 12} more"
-            if not messagebox.askyesno(
-                    "Overwrite existing file(s)?",
-                    f"This will overwrite:\n\n{shown}{more}\n\nProceed?"):
-                self.status_var.set("Cancelled")
-                return
+        # before the build starts, so there's no cross-thread dialog) -- unless
+        # the user opted to save a numbered copy instead of overwriting
+        if not self.opt_avoid_overwrite.get():
+            try:
+                planned = engine._planned_outputs(
+                    files, self.output_var.get().strip() or None,
+                    self.opt_combine.get(), self.opt_unformatted.get(), self.opt_separate.get())
+            except Exception:
+                planned = []
+            existing = [p for p in planned if os.path.exists(p)]
+            if existing:
+                shown = "\n".join("  • " + os.path.basename(p) for p in existing[:12])
+                more = "" if len(existing) <= 12 else f"\n  …and {len(existing) - 12} more"
+                if not messagebox.askyesno(
+                        "Overwrite existing file(s)?",
+                        f"This will overwrite:\n\n{shown}{more}\n\nProceed? "
+                        f"(Or tick “save a numbered copy” to keep them.)"):
+                    self.status_var.set("Cancelled")
+                    return
         self._save_settings(silent=True)
         self.cancel_event = threading.Event()
         self.run_btn.config(state='disabled')
@@ -794,6 +801,7 @@ class LineageApp:
             max_workers=None if self.opt_auto_workers.get() else self.worker_count.get(),
             write_error_log=self.opt_error_log.get(),
             stop_on_error=self.opt_stop_on_error.get(),
+            avoid_overwrite=self.opt_avoid_overwrite.get(),
             cancel=self.cancel_event,
         )
         self.worker = threading.Thread(target=self._worker_main, args=(kwargs,), daemon=True)
@@ -908,6 +916,7 @@ class LineageApp:
                 'workers': self.worker_count.get(),
                 'error_log': self.opt_error_log.get(),
                 'stop_on_error': self.opt_stop_on_error.get(),
+                'avoid_overwrite': self.opt_avoid_overwrite.get(),
                 'dark': self.dark.get(),
             },
         }
@@ -967,6 +976,7 @@ class LineageApp:
         self._toggle_workers()
         self.opt_error_log.set(ui.get('error_log', False))
         self.opt_stop_on_error.set(ui.get('stop_on_error', False))
+        self.opt_avoid_overwrite.set(ui.get('avoid_overwrite', False))
         self.dark.set(ui.get('dark', False))
 
 
