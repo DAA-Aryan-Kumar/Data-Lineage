@@ -221,31 +221,45 @@ class LineageApp:
             self.log_text.tag_configure(tag, foreground=col, spacing1=1,
                                         font=('Consolas', 9, 'bold') if bold else ('Consolas', 9))
 
-    def _make_check_img(self, checked: bool, bg: str, field: str) -> tk.PhotoImage:
-        """A 16px checkbox indicator: a bordered box, plus a green tick if checked."""
+    def _make_check_img(self, checked: bool, bg: str, field: str,
+                        disabled: bool = False) -> tk.PhotoImage:
+        """A 16px checkbox indicator: a bordered box, plus a green tick if
+        checked. `disabled` mutes the colours so a disabled box reads as greyed
+        out (clam doesn't dim a custom image indicator on its own)."""
         n = 16
+        border = '#4a4a4a' if disabled else '#8a8a8a'
+        interior = '#333333' if disabled else field
+        tick = '#5e7d5e' if disabled else '#86e086'
         img = tk.PhotoImage(master=self.root, width=n, height=n)
         img.put(bg, to=(0, 0, n, n))                  # blend into the dark background
-        img.put('#8a8a8a', to=(2, 2, n - 1, n - 1))   # box border
-        img.put(field, to=(3, 3, n - 2, n - 2))       # box interior
-        if checked:                                    # draw a thick green check stroke
+        img.put(border, to=(2, 2, n - 1, n - 1))      # box border
+        img.put(interior, to=(3, 3, n - 2, n - 2))    # box interior
+        if checked:                                    # draw a thick check stroke
             stroke = [(3, 8), (4, 9), (5, 10), (6, 11),
                       (7, 10), (8, 9), (9, 8), (10, 7), (11, 6), (12, 5), (13, 4)]
             for x, y in stroke:
-                img.put('#86e086', to=(x, y, x + 2, y + 2))
+                img.put(tick, to=(x, y, x + 2, y + 2))
         return img
 
     def _install_dark_check(self, style, bg: str, field: str):
         """Replace clam's checkbox indicator (its checked mark looks like an X)
-        with a drawn box + green tick. Created once; the layout change applies
-        only to clam, so light mode keeps its native vista checkbox."""
+        with a drawn box + green tick, including muted disabled variants.
+        Created once; the layout change applies only to clam, so light mode
+        keeps its native vista checkbox."""
         if not getattr(self, '_dark_check', None):
-            self._dark_check = (self._make_check_img(False, bg, field),
-                                self._make_check_img(True, bg, field))
+            self._dark_check = {
+                'off': self._make_check_img(False, bg, field),
+                'on': self._make_check_img(True, bg, field),
+                'off_dis': self._make_check_img(False, bg, field, disabled=True),
+                'on_dis': self._make_check_img(True, bg, field, disabled=True),
+            }
             try:
-                style.element_create('Dark.Checkbutton.indicator', 'image',
-                                     self._dark_check[0],
-                                     ('selected', self._dark_check[1]),
+                c = self._dark_check
+                # state specs are matched in order, most-specific first
+                style.element_create('Dark.Checkbutton.indicator', 'image', c['off'],
+                                     ('disabled', 'selected', c['on_dis']),
+                                     ('disabled', c['off_dis']),
+                                     ('selected', c['on']),
                                      padding=(0, 0, 6, 0), sticky='')
             except tk.TclError:
                 pass   # already registered (theme toggled before)
@@ -281,10 +295,22 @@ class LineageApp:
         return inner
 
     def _on_mousewheel(self, event):
-        """Scroll the visible tab's canvas (one wheel binding for all tabs)."""
+        """A scrollable list/text under the pointer (the file list, the log, the
+        rule boxes) scrolls itself first when it has hidden content; otherwise
+        the wheel scrolls the whole tab."""
+        delta = -1 if event.delta > 0 else 1
+        w = self.root.winfo_containing(event.x_root, event.y_root)
+        if isinstance(w, (tk.Listbox, tk.Text)):
+            try:
+                first, last = w.yview()
+                if first > 0.0 or last < 1.0:        # has rows hidden above/below
+                    w.yview_scroll(delta, 'units')
+                    return
+            except tk.TclError:
+                pass
         cvs = self._tab_canvases.get(self.notebook.select())
         if cvs is not None:
-            cvs.yview_scroll(-1 if event.delta > 0 else 1, 'units')
+            cvs.yview_scroll(delta, 'units')
 
     def _build_layout(self):
         header = ttk.Frame(self.root, padding=(16, 12, 16, 4))
@@ -396,10 +422,15 @@ class LineageApp:
         ttk.Entry(out_frame, textvariable=self.output_var).pack(
             side='left', fill='x', expand=True, padx=8)
         ttk.Button(out_frame, text="Browse…", command=self._pick_output).pack(side='left')
-        ttk.Label(tab, text="Leave blank to auto-name the output next to the first input "
-                            "file — a single report after its dashboard/table, a combined "
-                            "workbook as \"Data Lineage Workbook.xlsx\".",
-                  style='Sub.TLabel').pack(anchor='w')
+        naming_hint = ttk.Label(
+            tab, text="Leave blank to auto-name the output next to the first input file — "
+                      "a single report after its dashboard/table, a combined workbook as "
+                      "\"Data Lineage Workbook.xlsx\".",
+            style='Sub.TLabel', justify='left')
+        naming_hint.pack(anchor='w', fill='x')
+        # wrap rather than clip at narrow widths
+        tab.bind('<Configure>',
+                 lambda e: naming_hint.configure(wraplength=max(280, e.width - 24)), add='+')
 
         self.opt_detailed = tk.BooleanVar(value=True)
         self.opt_combine = tk.BooleanVar(value=True)
@@ -421,13 +452,17 @@ class LineageApp:
         self.combine_cb = ttk.Checkbutton(comb, text="Combine into one workbook",
                                           variable=self.opt_combine)
         self.combine_cb.pack(anchor='w', padx=6, pady=2)
+        self.opt_auto_workers = tk.BooleanVar(value=True)
+        ttk.Checkbutton(comb, text="Auto worker count (one per report, capped at CPUs)",
+                        variable=self.opt_auto_workers, command=self._toggle_workers
+                        ).pack(anchor='w', padx=6, pady=2)
         wrow = ttk.Frame(comb)
         wrow.pack(anchor='w', padx=6, pady=2)
         ttk.Label(wrow, text="Worker process cap:").pack(side='left')
-        ttk.Spinbox(wrow, from_=1, to=max(1, os.cpu_count() or 8), width=4,
-                    textvariable=self.worker_count).pack(side='left', padx=4)
-        ttk.Label(comb, text="Upper limit — at most one worker per report is used.",
-                  style='Sub.TLabel').pack(anchor='w', padx=6)
+        self.worker_spin = ttk.Spinbox(wrow, from_=1, to=max(1, os.cpu_count() or 8),
+                                       width=4, textvariable=self.worker_count)
+        self.worker_spin.pack(side='left', padx=4)
+        self._toggle_workers()
         self.opt_detailed.trace_add('write', self._toggle_detailed)
         self.opt_combine.trace_add('write', self._toggle_detailed)
         self._toggle_detailed()
@@ -465,6 +500,11 @@ class LineageApp:
         that includes detailed sheets."""
         ok = self.opt_detailed.get() and self.opt_combine.get()
         self.sep_cb.configure(state='normal' if ok else 'disabled')
+
+    def _toggle_workers(self, *_):
+        """The worker-cap spinbox is only editable when Auto is off."""
+        self.worker_spin.configure(
+            state='disabled' if self.opt_auto_workers.get() else 'normal')
 
     # ---- tab 2: pruning rules -------------------------------------------------
     def _build_rules_tab(self):
@@ -751,7 +791,7 @@ class LineageApp:
             separate_detailed=self.opt_separate.get(),
             unformatted=self.opt_unformatted.get(),
             combine=self.opt_combine.get(),
-            max_workers=self.worker_count.get(),
+            max_workers=None if self.opt_auto_workers.get() else self.worker_count.get(),
             write_error_log=self.opt_error_log.get(),
             stop_on_error=self.opt_stop_on_error.get(),
             cancel=self.cancel_event,
@@ -864,6 +904,7 @@ class LineageApp:
                 'separate_detailed': self.opt_separate.get(),
                 'unformatted': self.opt_unformatted.get(),
                 'combine': self.opt_combine.get(),
+                'auto_workers': self.opt_auto_workers.get(),
                 'workers': self.worker_count.get(),
                 'error_log': self.opt_error_log.get(),
                 'stop_on_error': self.opt_stop_on_error.get(),
@@ -921,7 +962,9 @@ class LineageApp:
         self.opt_separate.set(ui.get('separate_detailed', False))
         self.opt_unformatted.set(ui.get('unformatted', False))
         self.opt_combine.set(ui.get('combine', True))
+        self.opt_auto_workers.set(ui.get('auto_workers', True))
         self.worker_count.set(ui.get('workers', os.cpu_count() or 4))
+        self._toggle_workers()
         self.opt_error_log.set(ui.get('error_log', False))
         self.opt_stop_on_error.set(ui.get('stop_on_error', False))
         self.dark.set(ui.get('dark', False))
