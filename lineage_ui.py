@@ -431,10 +431,6 @@ class LineageApp:
         # wrap rather than clip at narrow widths
         tab.bind('<Configure>',
                  lambda e: naming_hint.configure(wraplength=max(280, e.width - 24)), add='+')
-        self.opt_avoid_overwrite = tk.BooleanVar(value=False)
-        ttk.Checkbutton(tab, variable=self.opt_avoid_overwrite,
-                        text="If a file already exists, save a numbered copy instead of "
-                             "overwriting it").pack(anchor='w', pady=(4, 0))
 
         self.opt_detailed = tk.BooleanVar(value=True)
         self.opt_combine = tk.BooleanVar(value=True)
@@ -463,7 +459,7 @@ class LineageApp:
         wrow = ttk.Frame(comb)
         wrow.pack(anchor='w', padx=6, pady=2)
         ttk.Label(wrow, text="Worker process cap:").pack(side='left')
-        self.worker_spin = ttk.Spinbox(wrow, from_=1, to=max(64, (os.cpu_count() or 8)),
+        self.worker_spin = ttk.Spinbox(wrow, from_=1, to=max(1, os.cpu_count() or 8),
                                        width=4, textvariable=self.worker_count)
         self.worker_spin.pack(side='left', padx=4)
         self._toggle_workers()
@@ -748,6 +744,41 @@ class LineageApp:
                     labels[prefix.strip()] = label.strip()
         return labels
 
+    def _ask_overwrite(self, existing: list) -> str:
+        """Modal 3-way dialog when output files already exist.
+        Returns 'overwrite', 'suffix' (save a numbered copy), or 'cancel'."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Output file already exists")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.configure(background=self.root.cget('background'))
+        shown = "\n".join("     • " + os.path.basename(p) for p in existing[:12])
+        more = "" if len(existing) <= 12 else f"\n     …and {len(existing) - 12} more"
+        msg = ("These output file(s) already exist:\n\n" + shown + more +
+               "\n\n• Overwrite — replace them.\n"
+               "• Save a copy — keep the originals; write \"name (1).xlsx\", etc.\n"
+               "• Cancel — don't build.")
+        ttk.Label(dlg, text=msg, justify='left', wraplength=440).pack(
+            padx=16, pady=(16, 10), anchor='w')
+        choice = {'v': 'cancel'}
+
+        def pick(v):
+            choice['v'] = v
+            dlg.destroy()
+
+        row = ttk.Frame(dlg)
+        row.pack(padx=16, pady=(0, 14), fill='x')
+        # packed right-to-left: [Overwrite] is leftmost, Cancel rightmost
+        ttk.Button(row, text="Cancel", command=lambda: pick('cancel')).pack(side='right')
+        ttk.Button(row, text="Save a copy", command=lambda: pick('suffix')).pack(
+            side='right', padx=6)
+        ttk.Button(row, text="Overwrite", command=lambda: pick('overwrite')).pack(side='right')
+        dlg.bind('<Escape>', lambda e: pick('cancel'))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: pick('cancel'))
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return choice['v']
+
     def _run(self):
         files = list(self._files)
         if not files:
@@ -758,25 +789,21 @@ class LineageApp:
             messagebox.showerror("File not found", "\n".join(missing))
             return
         # confirm before overwriting any existing output (on the UI thread,
-        # before the build starts, so there's no cross-thread dialog) -- unless
-        # the user opted to save a numbered copy instead of overwriting
-        if not self.opt_avoid_overwrite.get():
-            try:
-                planned = engine._planned_outputs(
-                    files, self.output_var.get().strip() or None,
-                    self.opt_combine.get(), self.opt_unformatted.get(), self.opt_separate.get())
-            except Exception:
-                planned = []
-            existing = [p for p in planned if os.path.exists(p)]
-            if existing:
-                shown = "\n".join("  • " + os.path.basename(p) for p in existing[:12])
-                more = "" if len(existing) <= 12 else f"\n  …and {len(existing) - 12} more"
-                if not messagebox.askyesno(
-                        "Overwrite existing file(s)?",
-                        f"This will overwrite:\n\n{shown}{more}\n\nProceed? "
-                        f"(Or tick “save a numbered copy” to keep them.)"):
-                    self.status_var.set("Cancelled")
-                    return
+        # before the build starts, so there's no cross-thread dialog)
+        avoid_overwrite = False
+        try:
+            planned = engine._planned_outputs(
+                files, self.output_var.get().strip() or None,
+                self.opt_combine.get(), self.opt_unformatted.get(), self.opt_separate.get())
+        except Exception:
+            planned = []
+        existing = [p for p in planned if os.path.exists(p)]
+        if existing:
+            choice = self._ask_overwrite(existing)
+            if choice == 'cancel':
+                self.status_var.set("Cancelled")
+                return
+            avoid_overwrite = (choice == 'suffix')
         self._save_settings(silent=True)
         self.cancel_event = threading.Event()
         self.run_btn.config(state='disabled')
@@ -801,7 +828,7 @@ class LineageApp:
             max_workers=None if self.opt_auto_workers.get() else self.worker_count.get(),
             write_error_log=self.opt_error_log.get(),
             stop_on_error=self.opt_stop_on_error.get(),
-            avoid_overwrite=self.opt_avoid_overwrite.get(),
+            avoid_overwrite=avoid_overwrite,
             cancel=self.cancel_event,
         )
         self.worker = threading.Thread(target=self._worker_main, args=(kwargs,), daemon=True)
@@ -916,7 +943,6 @@ class LineageApp:
                 'workers': self.worker_count.get(),
                 'error_log': self.opt_error_log.get(),
                 'stop_on_error': self.opt_stop_on_error.get(),
-                'avoid_overwrite': self.opt_avoid_overwrite.get(),
                 'dark': self.dark.get(),
             },
         }
@@ -976,7 +1002,6 @@ class LineageApp:
         self._toggle_workers()
         self.opt_error_log.set(ui.get('error_log', False))
         self.opt_stop_on_error.set(ui.get('stop_on_error', False))
-        self.opt_avoid_overwrite.set(ui.get('avoid_overwrite', False))
         self.dark.set(ui.get('dark', False))
 
 

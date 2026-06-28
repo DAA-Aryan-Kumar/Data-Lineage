@@ -32,6 +32,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from collections import deque
 from xml.sax.saxutils import escape as _xml_escape, unescape as _xml_unescape
@@ -1160,7 +1161,7 @@ def _build_aux(results, fmt, source_labels, source_fallback, include_detailed) -
     sources, rootless = _aggregate_source_rows(results, renderer)
     _write_source_sheet(wb, renderer, sources, rootless)
 
-    fd, aux_path = tempfile.mkstemp(suffix='.xlsx')
+    fd, aux_path = tempfile.mkstemp(suffix='.xlsx', dir=_temp_root())
     os.close(fd)
     wb.save(aux_path)
     return aux_path
@@ -1234,7 +1235,7 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
     """Render every report to a standalone file in parallel, then splice their
     Summary/Detailed sheets + a combined index + merged Source Tables into one
     workbook by raw XML assembly."""
-    tmpdir = tempfile.mkdtemp(prefix='lineage_merge_')
+    tmpdir = tempfile.mkdtemp(prefix='merge_', dir=_temp_root())
     aux_path = None
     try:
         out_paths = [os.path.join(tmpdir, f'r{i}.xlsx') for i in range(len(input_files))]
@@ -1288,13 +1289,45 @@ def _build_combined_merged(input_files, output_path, eff_rules, fmt, source_labe
 # ===========================================================================
 # WORKBOOK ASSEMBLY
 # ===========================================================================
+def _temp_root() -> str:
+    """A single app-owned scratch folder under the system temp dir, so all of
+    our intermediate files live in one place (easy to find / sweep). The system
+    temp dir is always writable and cross-platform, unlike the app's own folder
+    which may be read-only (Program Files, a network share, etc.)."""
+    root = os.path.join(tempfile.gettempdir(), 'DataLineageBuilder')
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _sweep_stale_temp(max_age_hours: float = 1.0):
+    """Best-effort cleanup of leftover scratch files from earlier runs that were
+    killed before their normal cleanup (e.g. ended via Task Manager). Only items
+    older than max_age_hours are removed, so a concurrent/active run's temp is
+    never touched. Failures (locked files) are ignored."""
+    root = os.path.join(tempfile.gettempdir(), 'DataLineageBuilder')
+    if not os.path.isdir(root):
+        return
+    cutoff = time.time() - max_age_hours * 3600
+    for name in os.listdir(root):
+        p = os.path.join(root, name)
+        try:
+            if os.path.getmtime(p) >= cutoff:
+                continue
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.remove(p)
+        except OSError:
+            pass
+
+
 def _avoid_existing(path: str) -> str:
-    """Return `path`, or the first 'name (N).ext' that doesn't exist yet, so an
-    existing output is kept instead of overwritten (opt-in)."""
+    """Return `path`, or the first 'name (N).ext' (N starting at 1) that doesn't
+    exist yet, so an existing output is kept instead of overwritten (opt-in)."""
     if not os.path.exists(path):
         return path
     base, ext = os.path.splitext(path)
-    for n in range(2, 1000):
+    for n in range(1, 1000):
         alt = f'{base} ({n}){ext}'
         if not os.path.exists(alt):
             return alt
@@ -1403,6 +1436,7 @@ def build_workbooks(input_files: list[str], output_path: str | None = None,
 
     if not input_files:
         raise ValueError("No input files provided.")
+    _sweep_stale_temp()           # clear scratch left by any previously-killed run
     # Drop duplicate inputs (same file listed twice) so the output never gets
     # duplicate sheets; keep first-occurrence order.
     deduped = _dedup_inputs(input_files)
@@ -1747,9 +1781,6 @@ def main(argv=None):
                              "(default: skip it and continue)")
     parser.add_argument('-y', '--yes', action='store_true',
                         help="Overwrite existing output files without prompting")
-    parser.add_argument('--no-overwrite', action='store_true',
-                        help="If an output file exists, write a numbered copy instead of "
-                             "overwriting it (skips the prompt)")
     parser.add_argument('--drop-no-lineage', action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Ignore root queries that have no upstream lineage "
@@ -1793,21 +1824,27 @@ def main(argv=None):
     if args.unformatted and args.separate:
         log.warning("--separate ignored: --unformatted writes a single raw workbook.")
 
-    # Confirm before overwriting existing output (skip with --yes or
-    # --no-overwrite, which writes a numbered copy instead).
-    if not args.yes and not args.no_overwrite:
+    # Confirm before overwriting existing output (skip with --yes). The prompt
+    # offers a third choice -- save a numbered copy instead of overwriting.
+    cli_avoid_overwrite = False
+    if not args.yes:
         existing = [p for p in _planned_outputs(inputs, args.output, not args.no_combine,
                                                 args.unformatted, args.separate)
                     if os.path.exists(p)]
         if existing:
-            print("These output file(s) already exist and will be overwritten:")
+            print("These output file(s) already exist:")
             for p in existing:
                 print(f"  {p}")
+            print("  [O]verwrite, save a [N]umbered copy (keeps the originals), or [C]ancel?")
             try:
-                proceed = input("Proceed? [y/N]: ").strip().lower() in ('y', 'yes')
+                resp = input("Choice [o/n/C]: ").strip().lower()
             except EOFError:
-                proceed = False
-            if not proceed:
+                resp = ''
+            if resp in ('o', 'overwrite'):
+                pass
+            elif resp in ('n', 'number', 'numbered', 'copy'):
+                cli_avoid_overwrite = True
+            else:
                 print("Cancelled.")
                 sys.exit(0)
 
@@ -1820,7 +1857,7 @@ def main(argv=None):
                                   max_workers=args.workers,
                                   write_error_log=args.error_log,
                                   stop_on_error=args.stop_on_error,
-                                  avoid_overwrite=args.no_overwrite)
+                                  avoid_overwrite=cli_avoid_overwrite)
     except Exception as exc:
         log.error("Failed to process lineage: %s", exc)
         sys.exit(1)
