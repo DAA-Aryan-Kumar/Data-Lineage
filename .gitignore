@@ -1,0 +1,17 @@
+__pycache__/
+~$*
+lineage_settings.json
+.claude/
+
+# Generated lineage workbooks (build artifacts, regenerable from inputs)
+*__Lineage.xlsx
+*__lineage.xlsx
+*_Detailed.xlsx
+Data Lineage Report*.xlsx
+
+# PyInstaller / packaged executable artifacts
+build/
+dist/
+*.spec
+*.exe
+watermark.txt
